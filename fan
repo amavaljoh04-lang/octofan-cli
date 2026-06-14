@@ -399,7 +399,7 @@ case "${1:-}" in
         # Verifier si c'est un nombre
         if [[ "$1" =~ ^[0-9]+$ ]]; then
             check_ports
-            local speed=$1
+            speed=$1
             [[ $speed -gt 100 ]] && speed=100
             [[ $speed -lt 0 ]] && speed=0
             apply_speed "$speed"
