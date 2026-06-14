@@ -2,26 +2,20 @@
 
 CLI simple pour controler les fans d'un boitier Octominer depuis Pop!_OS / Ubuntu / Linux.
 
-## Installation rapide
+Tout inclus : binaire + script + service systemd.
+
+## Installation (une seule commande)
 
 ```bash
-# Telecharger
-sudo curl -sL -o /usr/local/bin/fan \
-  "https://raw.githubusercontent.com/hairionjohnny1982-ai/octofan-cli/main/fan"
-sudo chmod +x /usr/local/bin/fan
+git clone https://github.com/amavaljoh04-lang/octofan-cli.git
+cd octofan-cli
+sudo bash install.sh
+```
 
-# Installer le binaire Octofan (si pas deja fait)
-sudo mkdir -p /hive/opt/octofan
-sudo curl -sL -o /hive/opt/octofan/fan_controller_cli \
-  "https://raw.githubusercontent.com/minershive/hiveos-linux/master/hive/opt/octofan/fan_controller_cli"
-sudo chmod +x /hive/opt/octofan/fan_controller_cli
-sudo apt-get install -y libusb-0.1-4
+C'est tout. Ensuite scanner les ports (premiere fois) :
 
-# Scanner les ports (premiere fois)
+```bash
 sudo fan scan
-
-# Installer le service systemd (persiste apres reboot)
-sudo fan install
 ```
 
 ## Utilisation
@@ -38,22 +32,31 @@ sudo fan scan     # Re-scanner les ports
 sudo fan help     # Aide
 ```
 
-## Fichiers
+## Contenu du repo
 
 | Fichier | Description |
 |---------|-------------|
 | `fan` | CLI principal - commande directe |
+| `fan_controller_cli` | Binaire de controle hardware (HiveOS) |
+| `install.sh` | Installeur tout-en-un |
 | `octofan-manager.sh` | Version interactive avec dashboard (screen) |
-| `/etc/octofan.conf` | Configuration sauvegardee (ports, vitesse) |
 
-## Prerequis
+## Ce que fait install.sh
 
-- Linux (Pop!_OS, Ubuntu, HiveOS...)
-- `libusb-0.1-4` (`sudo apt install libusb-0.1-4`)
-- Boitier Octominer avec controleur USB
+1. Installe `libusb` (dependance USB)
+2. Copie `fan_controller_cli` dans `/hive/opt/octofan/`
+3. Copie la commande `fan` dans `/usr/local/bin/`
+4. Active le service systemd (persiste apres reboot)
+
+## Persistance
+
+- Les ports scannes sont sauvegardes dans `/etc/octofan.conf`
+- La derniere vitesse est restauree automatiquement au demarrage
+- Pas besoin de re-scanner apres un reboot
 
 ## Hardware supporte
 
 - Octominer HW v1.2 / FW 3.0 / CLI 1.7
-- 4 fans synchronises
+- Jusqu'a 4 fans synchronises
 - Temperatures intake/outgoing
+- Pop!_OS, Ubuntu, ou tout Linux avec libusb
