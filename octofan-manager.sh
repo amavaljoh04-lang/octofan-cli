@@ -1,1176 +1,1290 @@
 #!/usr/bin/env bash
-###############################################################################
-#  octofan-manager.sh  -  Gestion interactive de ventilation Octominer
-#  Basé sur le code octofan de HiveOS (hiveos-linux)
-#  Compatible HW v1.2 / FW 3.0 / CLI 1.7
-#
-#  Lancement :  sudo screen -S fanctl ./octofan-manager.sh
-#  Ou direct :  sudo ./octofan-manager.sh
-#
-#  Le script tourne en boucle, affiche un dashboard en temps réel,
-#  et accepte des commandes clavier à tout moment.
-###############################################################################
 
-set -o pipefail
+#Must be empty in release
+DEBUG_COMMANDS=
 
 ################################################################################
-# VERIFIER ROOT (nécessaire pour USB)
+# Firmware info
+FIRMWARE_UPDATE_LOG="/hive/opt/octofan/fw_update.log"
+FW_VERSION_07="1.1"
+FW_VERSION_09="1.6"
+FW_FILENAME_07="/hive/opt/octofan/firmware_07.hex"
+FW_FILENAME_09="/hive/opt/octofan/firmware_09.hex"
+FIRMWARE_MD5_07="46392f7827d482586768afb34ca02322"
+FIRMWARE_MD5_09="4b39fb3797d6c956d44284c6e71defd6"
+MAINTENANCE_SEM_NAME="/tmp/octofan_fw_update"
 ################################################################################
-if [[ $EUID -ne 0 ]]; then
-    echo "Ce script doit etre lance avec sudo."
-    echo "Usage: sudo $0"
-    exit 1
+
+if [[ -z $OCTOFAN_CONF ]]; then #reread env variables as after upgrade this can be empty
+  source /etc/environment
+  export $(cat /etc/environment | grep -vE '^$|^#' | cut -d= -f1) #export all variables from file
 fi
 
-################################################################################
-# COULEURS
-################################################################################
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NOCOLOR='\033[0m'
+. colors
+. /hive-config/rig.conf
 
-################################################################################
-# CONFIGURATION PAR DEFAUT
-################################################################################
-OCTOFAN_BIN="${OCTOFAN_BIN:-/hive/opt/octofan/fan_controller_cli}"
-OCTOFAN_CONF="${OCTOFAN_CONF:-/hive-config/octofan/octofan.conf}"
+export DISPLAY=":0"
+
+DEF_SLEEP_TIME=10
+
+OCTOFAN_BIN="/hive/opt/octofan/fan_controller_cli"
 CLI_OUTPUT="/tmp/fan_controller_cli_output"
+CLI_ERROR_COUNTER="/tmp/octofan_cli_error_count"
 CLI_TMP_OUTPUT="/tmp/octofan_cli_temp.txt"
-MANAGER_CONF="/tmp/octofan_manager.conf"
-LOG_FILE="/tmp/octofan-manager.log"
-MAINTENANCE_SEM="/tmp/octofan_fw_update"
+OCTOFAN_PERCENT_PWM="/hive/opt/octofan/octofan_percent_pwm"
+PSU_LAST_POWER_FILENAME="/tmp/octofan_psu_last_power"
 
-REFRESH_INTERVAL=10
-AUTO_ENABLED=1
-MANUAL_FAN=100
-MIN_FAN=30
-MAX_FAN=100
-TARGET_TEMP=66
-FAN_INC_SPEED_STEP=5
+CLI_LOG_BASE_NAME="/var/log/hive-octofan-cli" #without .log
+CLI_LOGS_BASE_DIR=/var/log/
+MAX_LOG_SIZE=10000000 #10m
 
-# Nombre de fans
-NUM_FANS=4
-
-# Mapping des fans physiques (ports)
-FAN0_PORT=2
-FAN1_PORT=3
-FAN2_PORT=4
-FAN3_PORT=5
-
-# Facteur PWM
-FAN_PWM_FACTOR=-30
+CALC_AVERAGE_SPEED=1
 
 ################################################################################
-# VARIABLES INTERNES
-################################################################################
-SELECTED_FAN="all"
-CURRENT_SPEEDS=(100 100 100 100)
-FAN_RPM=("--" "--" "--" "--")
-FAN_MAX_RPM=("--" "--" "--" "--")
-TEMPS=("N/A" "N/A" "N/A" "N/A" "N/A")
-PSU_VAC="N/A"
-PSU_PAC="N/A"
-PSU_VDC="N/A"
-FAN_PWM_FACTORS=($FAN_PWM_FACTOR $FAN_PWM_FACTOR $FAN_PWM_FACTOR $FAN_PWM_FACTOR)
-HW_DETECTED=0
-HW_VERSION=""
-FW_VERSION=""
-CLI_VERSION=""
-RUNNING=1
-LAST_CMD_MSG=""
-LAST_CMD_TIME=0
+#settings (for octofan.conf without DEF_), default values
+#fan LEDs 0-orange, 1-blue, 2-white
+#blink on errors
+DEF_BLINK_ON_ERRORS=1
+#LED number for blink on errors
+DEF_BLINK_ON_ERRORS_LED=0
+#blink type on errors: 0=off, 1=on, 2=blink 0.1s, 3=blink 1s, >=4=blink 3s
+DEF_BLINK_ON_ERRORS_TYPE=2
+#blink type on warnings: 0=off, 1=on, 2=blink 0.1s, 3=blink 1s, >=4=blink 3s
+DEF_BLINK_ON_WARNINGS_TYPE=3
+#blink off type: 0=off, 1=on, 2=blink 0.1s, 3=blink 1s, >=4=blink 3s
+DEF_BLINK_OFF_TYPE=0
+#blink to find the rig in rack
+DEF_BLINK_TO_FIND=0
+#LED number for blink to find the rig in rack
+DEF_BLINK_TO_FIND_LED=2
+#blink type to find the rig in rack: 0=off, 1=on, 2=blink 0.1s, 3=blink 1s, >=4=blink 3s
+DEF_BLINK_TO_FIND_TYPE=1
+#manual fan speed
+DEF_MANUAL_FAN=100
+#enabled auto fan control
+DEF_AUTO_ENABLED=1
+#minimal fan speed
+DEF_MIN_FAN=30
+#maximum fan speed
+DEF_MAX_FAN=100
 
-################################################################################
-# FONCTIONS UTILITAIRES
-################################################################################
+DEF_FAN_PWN_FACTOR=-30
 
-log_msg() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') | $1" >> "$LOG_FILE"
+DEF_TARGET_TEMP=66
+DEF_TARGET_MEM_TEMP=90
+DEF_TEMP_VARIATION=0
+DEF_FAN_INC_SPEED_STEP=5
+#######################################################################
+BLINK_ON_ERRORS=
+BLINK_TO_FIND=
+MANUAL_FAN=
+AUTO_ENABLED=
+MIN_FAN=
+MAX_FAN=
+
+BLINK_ON_ERRORS_LED=
+BLINK_ON_ERRORS_TYPE=
+BLINK_ON_WARNINGS_TYPE=
+BLINK_OFF_TYPE=
+BLINK_TO_FIND_LED=
+BLINK_TO_FIND_TYPE=
+
+FAN_ARRAY=()
+
+FAN_PWN_FACTORS=()
+
+FAN_INC_SPEED_FACTORS=()
+
+TARGET_TEMP=
+TARGET_MEM_TEMP=
+
+prev_temp_array=
+prev_mtemp_array=
+
+RECALIBRATE_TIME=70
+ERROR_RPM=1000 #send error message when fan max RPM is less
+WARNING_RPM=2000 #send warning message when fan max RPM is less
+
+
+#######################################################################
+
+#flag that the message was sent
+unable_to_set_fan_speed=0
+#unparsable data
+error_in_read_configs=0
+
+#######################################################################
+
+save_text_to_EEPROM () {
+  check_sem
+  [[ $? -ne 0 ]] && return 1 #octofan in maintenance mode
+
+  echo2 "${GREEN}Saving text to Octofan EEPROM${NOCOLOR}"
+  local current_ip=`hostname -I | sed 's/ /\n/g' | head -1`
+  #$OCTOFAN_BIN -o 1,0,3 -v "ROH Ultra"
+  $OCTOFAN_BIN -o 0,0,4 -v 0
+  local str=`print_c "$WORKER_NAME" 10`
+  $OCTOFAN_BIN -o 0,0,3 -v "$str"
+  $OCTOFAN_BIN -o 0,2,2 -v "IP: $current_ip"
+  $OCTOFAN_BIN -o 0,3,2 -v "Algo:"
+  $OCTOFAN_BIN -o 0,4,2 -v "Hashrate:"
+  $OCTOFAN_BIN -o 0,5,2 -v "Power:"
+  $OCTOFAN_BIN -o 0,6,2 -v "In:"
+  $OCTOFAN_BIN -o 10,6,2 -v "Out:"
+  $OCTOFAN_BIN -o 0,7,2 -v ""
 }
 
-show_msg() {
-    LAST_CMD_MSG="$1"
-    LAST_CMD_TIME=$(date +%s)
-    log_msg "$1"
+
+update_text () {
+  check_sem
+  [[ $? -ne 0 ]] && return 1 #octofan in maintenance mode
+
+  check_cli_output
+  fan_autodetect
+
+  echo2 "${GREEN}Updating Octofan OLED text${NOCOLOR}"
+  local hashrate=`echo "$2*1000" | bc`
+  hashrate=`shorten_hashrate $hashrate`
+  power_ac=`cat $CLI_OUTPUT | grep "PSU" | grep " Pac:" | grep -v "Peak" | cut -d " " -f 6 | awk '{sum+=$1} END { printf "%.0f", sum }'`
+  in_t=`cat $CLI_OUTPUT | grep "BME280 No. 0 Temp: " | cut -d " " -f 5 | awk '{print int($1)}'`
+  [[ -z $in_t || $in_t == '-nan' ]] && in_t=`cat $CLI_OUTPUT | grep "Temperature No. 0" | cut -d " " -f 5 | awk '{print int($1)}'`
+  out_t=`cat $CLI_OUTPUT | grep "BME280 No. 1 Temp: " | cut -d " " -f 5 | awk '{print int($1)}'`
+  [[ -z $out_t || $out_t == '-nan' ]] && out_t=`cat $CLI_OUTPUT | grep "Temperature No. 1" | cut -d " " -f 5 | awk '{print int($1)}'`
+  local f_speeds; local t_speed
+  for (( i = 0; i < ${#FAN_ARRAY[@]}; i++ )); do
+    t_speed=`cat $CLI_OUTPUT | grep "FAN No. ${FAN_ARRAY[$i]} RPM in percent:" | cut -d " " -f 7`
+    [[ $t_speed -lt 100 ]] && t_speed+="%"
+    f_speeds+="$t_speed "
+  done
+  local str=`print_l $1 14`
+  $OCTOFAN_BIN -o 6,3,0 -v "$str"
+  str=`print_l $hashrate 10`
+  $OCTOFAN_BIN -o 10,4,0 -v "$str"
+  str=`print_l "${power_ac}W" 13`
+  $OCTOFAN_BIN -o 7,5,0 -v "$str"
+  #In 20°C  Out 40°C
+  str=`print_l "${in_t}°C" 5`
+  $OCTOFAN_BIN -o 4,6,0 -v "$str"
+  str=`print_l "${out_t}°C" 5`
+  $OCTOFAN_BIN -o 15,6,0 -v "$str"
+  #99% 99% 99% 100 100
+  str=`print_l "$f_speeds" 20`
+  $OCTOFAN_BIN -o 0,7,0 -v "$str"
 }
 
-check_maintenance() {
-    if [[ -f "$MAINTENANCE_SEM" ]]; then
-        local age=0
-        age=$(( $(date +%s) - $(stat --format='%Y' "$MAINTENANCE_SEM" 2>/dev/null || echo 0) ))
-        [[ $age -le 60 ]] && return 1
+function echo2 {
+  echo -e "$1"
+}
+
+check_config () {
+  if [ ! -f $OCTOFAN_CONF ]; then
+    echo2 "${RED}No config $OCTOFAN_CONF${NOCOLOR}"
+  fi
+}
+
+print_space () {
+  for i in $(seq $1); do
+    echo -n ' '
+  done
+}
+
+print_l () {
+  local length=${#1}
+  if [[ $2 -gt $length ]]; then
+    echo -n "$1"
+    print_space $(($2 - $length))
+  else
+    [[ length -ne $2 ]] && echo "$1" | cut -c1-$2 || echo "$1"
+  fi
+}
+
+print_r () {
+  local length=${#1}
+  if [[ $2 -gt $length ]]; then
+    print_space $(($2 - $length))
+    echo -n "$1"
+  else
+    [[ length -ne $2 ]] && echo "$1" | cut -c1-$2 || echo "$1"
+  fi
+}
+
+print_c () {
+  local length=${#1}
+  if [[ $2 -gt $length ]]; then
+    l_space=$((($2 - $length) / 2))
+    r_space=$(($2 - $l_space - $length))
+    print_space $l_space
+    echo -n "$1"
+    print_space $r_space
+  else
+    [[ length -ne $2 ]] && echo "$1" | cut -c1-$2 || echo "$1"
+  fi
+}
+
+function echo2 {
+  echo -e "$1"
+}
+
+check_config () {
+  if [ ! -f $OCTOFAN_CONF ]; then
+    echo2 "${RED}No config $OCTOFAN_CONF${NOCOLOR}"
+  fi
+}
+
+shorten_hashrate () {
+  if [[ $1 > 100 ]]; then
+    echo $1 | numfmt --suffix="h/s" --to=si
+  else
+    echo $1 | numfmt --suffix="h/s" --format="%'3.3f"
+  fi
+}
+
+calc_fan_speed () {
+  if [[ $AUTO_ENABLED -ne 1 ]]; then
+    if [[ ! -z $MANUAL_FAN ]]; then
+      fan_speed=$MANUAL_FAN #showing manual value
+    else
+      fan_speed=100 #can't get manual value, setting fan speed to 100%
     fi
     return 0
-}
+  fi
 
-# Détecter le matériel Octofan
-detect_hardware() {
-    # Vérifier si le binaire existe
-    if [[ ! -x "$OCTOFAN_BIN" ]]; then
-        echo -e "${RED}Binaire $OCTOFAN_BIN introuvable ou non executable${NOCOLOR}"
-        HW_DETECTED=0
-        return 1
-    fi
+  if [[ -z $bus_id_array ]]; then
+    [[ $DEBUG_COMMANDS -ge 1 ]] && echo "check GPU_DETECT_JSON and do nothing while not exist"
+    while true; do
+      if [ -f $GPU_DETECT_JSON ]; then
+        bus_id_array=(`cat $GPU_DETECT_JSON | jq -c '[ . | to_entries[] | select(.value) | .value.busid [0:2] ]'`)
+        break
+      else
+        echo2 "${RED}No $GPU_DETECT_JSON file exist${NOCOLOR}"
+      fi
+      sleep 10
+    done
+  fi
 
-    # Tester la communication
-    local output
-    output=$($OCTOFAN_BIN -r 2>/dev/null)
-    if echo "$output" | grep -q "Serial No:"; then
-        HW_DETECTED=1
-        HW_VERSION=$(echo "$output" | grep "VERSION-HW:" | awk '{print $2}')
-        FW_VERSION=$(echo "$output" | grep "VERSION-FW:" | awk '{print $2}')
-        CLI_VERSION=$(echo "$output" | grep "VERSION-CLI:" | awk '{print $2}')
-        # Sauvegarder la sortie initiale
-        echo "$output" > "$CLI_OUTPUT"
-        return 0
-    fi
+  if [[ -z $fan_array ]]; then
+    [[ $DEBUG_COMMANDS -ge 1 ]] && echo "check GPU_STATS_JSON and do nothing while not exist"
+    while true; do
+      if [ -f $GPU_STATS_JSON ]; then
+        fan_array=(`cat $GPU_STATS_JSON | tail -1 | jq -c ".fan"`)
+        break
+      else
+        echo2 "${RED}No $GPU_STATS_JSON file exist${NOCOLOR}"
+      fi
+      sleep 10
+    done
+  fi
 
-    # Essayer aussi via lsusb
-    if command -v lsusb &>/dev/null; then
-        local count
-        count=$(lsusb 2>/dev/null | grep -c '16c0:05dc')
-        if [[ $count -ge 1 ]]; then
-            HW_DETECTED=1
-            return 0
-        fi
-    fi
+  if [[ -z $temp_array ]]; then
+    [[ $DEBUG_COMMANDS -ge 1 ]] && echo "check GPU_STATS_JSON and do nothing while not exist"
+    while true; do
+      if [ -f $GPU_STATS_JSON ]; then
+        temp_array=(`cat $GPU_STATS_JSON | tail -1 | jq -c ".temp"`)
+        break
+      else
+        echo2 "${RED}No $GPU_STATS_JSON file exist${NOCOLOR}"
+      fi
+      sleep 10
+    done
+  fi
 
-    HW_DETECTED=0
-    return 1
-}
+  if [[ -z $mtemp_array ]]; then
+    [[ $DEBUG_COMMANDS -ge 1 ]] && echo "check GPU_STATS_JSON and do nothing while not exist"
+    while true; do
+      if [ -f $GPU_STATS_JSON ]; then
+        mtemp_array=(`cat $GPU_STATS_JSON | tail -1 | jq -c ".mtemp"`)
+        break
+      else
+        echo2 "${RED}No $GPU_STATS_JSON file exist${NOCOLOR}"
+      fi
+      sleep 10
+    done
+  fi
 
-# Convertir pourcentage en valeur PWM (0-255)
-percent_to_pwm() {
-    local percent=$1
-    local fan_idx=${2:-}
-    local factor=$FAN_PWM_FACTOR
-
-    if [[ -n "$fan_idx" && -n "${FAN_PWM_FACTORS[$fan_idx]:-}" ]]; then
-        factor=${FAN_PWM_FACTORS[$fan_idx]}
-    fi
-
-    local pwm
-    pwm=$(awk "BEGIN { printf \"%.0f\", 255 * $percent / 100 + $factor }")
-    [[ $pwm -gt 255 ]] && pwm=255
-    [[ $pwm -lt 0 ]] && pwm=0
-    echo "$pwm"
-}
-
-get_fan_port() {
+  fan_speed=$MIN_FAN
+  local t_bus_id=0
+  local a_fan=0
+  local prev_fan=0
+  local s_fan=0
+  local n_fan=0
+  local a_temp=0
+  local a_mtemp=0
+  local i=0
+  local a_fan_inc_speed=-2000
+  local t_fan_inc_speed=-1
+  local a_gpus_fan_max_count=0
+  if [[ ! -z $bus_id_array && ! -z $fan_array ]]; then
     case $1 in
-        0) echo "$FAN0_PORT" ;;
-        1) echo "$FAN1_PORT" ;;
-        2) echo "$FAN2_PORT" ;;
-        3) echo "$FAN3_PORT" ;;
+      0) #fan 0 blows on cards 01:00.0, 02:00.0, 03:00.0
+        local first_gpu=1
+        local last_gpu=3
+      ;;
+      1) #fan 1 blows on cards 05:00.0, 06:00.0, 07:00.0
+        local first_gpu=5
+        local last_gpu=7
+      ;;
+      2) #fan 2 blows on cards 08:00.0, 09:00.0, 0a:00.0
+        local first_gpu=8
+        local last_gpu=10
+      ;;
+      5)
+        local first_gpu=1
+        local last_gpu=13
     esac
-}
 
-################################################################################
-# FONCTIONS HARDWARE
-################################################################################
+    for (( i=$first_gpu; i <= $last_gpu; i++ )); do
+      t_fan_inc_speed=
+      t_fan_inc_speed_m=
+      for ((j = 0; j < $(jq length <<< "$bus_id_array"); j++)); do
+        t_bus_id=$(jq -r .[$j] <<< $bus_id_array)
+        if [[ "$(( 0x${t_bus_id} ))" == "$i" ]]; then
+          a_fan=$(jq -r .[$j] <<< $fan_array)
+          [[ $a_fan -gt $fan_speed ]] && fan_speed=$a_fan
+          [[ $a_fan -eq 0 ]] && a_fan=100 #fan broken or fanless GPU, increaseing case fan speed to cool down GPU
+          ((s_fan+=$a_fan)) && ((n_fan++))
 
-# Lire les données du contrôleur
-read_cli_data() {
-    [[ $HW_DETECTED -eq 0 ]] && return 1
-    check_maintenance || return 1
-
-    $OCTOFAN_BIN -r > "$CLI_TMP_OUTPUT" 2>/dev/null
-    if [[ $? -eq 0 ]] && grep -q "Serial No:" "$CLI_TMP_OUTPUT" 2>/dev/null; then
-        mv "$CLI_TMP_OUTPUT" "$CLI_OUTPUT" 2>/dev/null
-        return 0
-    fi
-    return 1
-}
-
-# Parser les données du CLI - compatible avec le format HW v1.2
-# Format attendu:
-#   Temperature No. 0 Celsius: 22
-#   1800W PSU Vac: 0.1
-#   FAN No. X RPM: YYYY  (si disponible)
-parse_cli_data() {
-    [[ ! -f "$CLI_OUTPUT" ]] && return 1
-
-    # Températures - le format est "Temperature No. X Celsius: YY"
-    # Avec cut -d " " -f 5, on obtient "22" pour "Temperature No. 0 Celsius: 22"
-    local in_t out_t psu_t1 psu_t2 psu_t3
-
-    # Essayer le format "Celsius: XX" d'abord
-    in_t=$(grep "Temperature No. 0" "$CLI_OUTPUT" 2>/dev/null | grep -oP ':\s*\K[0-9.]+')
-    out_t=$(grep "Temperature No. 1" "$CLI_OUTPUT" 2>/dev/null | grep -oP ':\s*\K[0-9.]+')
-
-    # Fallback: essayer le format ancien "Temperature No. 0 : XX"
-    if [[ -z "$in_t" ]]; then
-        in_t=$(grep "Temperature No. 0" "$CLI_OUTPUT" 2>/dev/null | awk '{print $NF}')
-    fi
-    if [[ -z "$out_t" ]]; then
-        out_t=$(grep "Temperature No. 1" "$CLI_OUTPUT" 2>/dev/null | awk '{print $NF}')
-    fi
-
-    # PSU Temperatures - format "1800W PSU T1: 0.0"
-    psu_t1=$(grep "PSU T1:" "$CLI_OUTPUT" 2>/dev/null | grep -oP 'T1:\s*\K[0-9.]+')
-    psu_t2=$(grep "PSU T2:" "$CLI_OUTPUT" 2>/dev/null | grep -oP 'T2:\s*\K[0-9.]+')
-    psu_t3=$(grep "PSU T3:" "$CLI_OUTPUT" 2>/dev/null | grep -oP 'T3:\s*\K[0-9.]+')
-
-    # Filtrer les valeurs aberrantes (>200 = capteur absent)
-    [[ -n "$in_t" ]] && (( $(echo "$in_t > 200" | bc -l 2>/dev/null || echo 0) )) && in_t=""
-    [[ -n "$out_t" ]] && (( $(echo "$out_t > 200" | bc -l 2>/dev/null || echo 0) )) && out_t=""
-    [[ -n "$psu_t1" ]] && (( $(echo "$psu_t1 > 200" | bc -l 2>/dev/null || echo 0) )) && psu_t1=""
-    [[ -n "$psu_t2" ]] && (( $(echo "$psu_t2 > 200" | bc -l 2>/dev/null || echo 0) )) && psu_t2=""
-    [[ -n "$psu_t3" ]] && (( $(echo "$psu_t3 > 200" | bc -l 2>/dev/null || echo 0) )) && psu_t3=""
-
-    TEMPS=("${in_t:-N/A}" "${out_t:-N/A}" "${psu_t2:-N/A}" "${psu_t1:-N/A}" "${psu_t3:-N/A}")
-
-    # PSU - format "1800W PSU Vac: 0.1"
-    PSU_VAC=$(grep "PSU Vac:" "$CLI_OUTPUT" 2>/dev/null | grep -oP 'Vac:\s*\K[0-9.]+')
-    PSU_PAC=$(grep "PSU Pac:" "$CLI_OUTPUT" 2>/dev/null | grep -oP 'Pac:\s*\K[0-9.]+')
-    PSU_VDC=$(grep "PSU Vdc:" "$CLI_OUTPUT" 2>/dev/null | grep -oP 'Vdc:\s*\K[0-9.]+')
-    PSU_VAC=${PSU_VAC:-N/A}
-    PSU_PAC=${PSU_PAC:-N/A}
-    PSU_VDC=${PSU_VDC:-N/A}
-
-    # Fans RPM et pourcentages - peut ne pas exister selon la version FW
-    for i in $(seq 0 $((NUM_FANS - 1))); do
-        local port
-        port=$(get_fan_port "$i")
-
-        local rpm_line
-        rpm_line=$(grep "FAN No. $port RPM:" "$CLI_OUTPUT" 2>/dev/null | head -1)
-        if [[ -n "$rpm_line" ]]; then
-            FAN_RPM[$i]=$(echo "$rpm_line" | grep -oP 'RPM:\s*\K[0-9]+')
-            FAN_RPM[$i]=${FAN_RPM[$i]:-"--"}
-        fi
-
-        local pct_line
-        pct_line=$(grep "FAN No. $port RPM in percent:" "$CLI_OUTPUT" 2>/dev/null)
-        if [[ -n "$pct_line" ]]; then
-            local pct
-            pct=$(echo "$pct_line" | grep -oP 'percent:\s*\K[0-9]+')
-            [[ -n "$pct" ]] && CURRENT_SPEEDS[$i]=$pct
-        fi
-
-        local max_line
-        max_line=$(grep "FAN No. $port max RPM:" "$CLI_OUTPUT" 2>/dev/null)
-        if [[ -n "$max_line" ]]; then
-            FAN_MAX_RPM[$i]=$(echo "$max_line" | grep -oP 'max RPM:\s*\K[0-9]+')
-            FAN_MAX_RPM[$i]=${FAN_MAX_RPM[$i]:-"--"}
-        fi
-    done
-}
-
-# Appliquer la vitesse d'un fan
-apply_fan_speed() {
-    local fan_idx=$1
-    local speed_pct=$2
-
-    if [[ $HW_DETECTED -eq 0 ]]; then
-        CURRENT_SPEEDS[$fan_idx]=$speed_pct
-        return 0
-    fi
-
-    check_maintenance || return 1
-
-    local port pwm
-    port=$(get_fan_port "$fan_idx")
-    pwm=$(percent_to_pwm "$speed_pct" "$fan_idx")
-    $OCTOFAN_BIN -f "$port" -v "$pwm" &>/dev/null
-    CURRENT_SPEEDS[$fan_idx]=$speed_pct
-    log_msg "FAN$fan_idx port=$port -> ${speed_pct}% PWM=$pwm"
-}
-
-apply_all_fans_speed() {
-    local speed=$1
-    for i in $(seq 0 $((NUM_FANS - 1))); do
-        apply_fan_speed "$i" "$speed"
-        sleep 0.1
-    done
-}
-
-set_led() {
-    local led=$1
-    local mode=$2
-    [[ $HW_DETECTED -eq 1 ]] && $OCTOFAN_BIN -l "$led" -v "$mode" &>/dev/null
-}
-
-recalibrate_fans() {
-    show_msg "Recalibration des fans en cours..."
-
-    if [[ $HW_DETECTED -eq 0 ]]; then
-        show_msg "Pas de materiel detecte"
-        return 0
-    fi
-
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - recalibrate fans" > "$MAINTENANCE_SEM"
-
-    for i in $(seq 0 $((NUM_FANS - 1))); do
-        local port
-        port=$(get_fan_port "$i")
-        $OCTOFAN_BIN -f "$port" -v 255 &>/dev/null
-        sleep 0.1
-    done
-
-    sleep 5
-
-    local fans_max_rpm=()
-    for t in $(seq 1 10); do
-        $OCTOFAN_BIN -r > "$CLI_OUTPUT" 2>/dev/null
-        for i in $(seq 0 $((NUM_FANS - 1))); do
-            local port t_rpm
-            port=$(get_fan_port "$i")
-            t_rpm=$(grep "FAN No. $port RPM:" "$CLI_OUTPUT" 2>/dev/null | head -1 | grep -oP 'RPM:\s*\K[0-9]+')
-            t_rpm=${t_rpm:-0}
-            [[ ${fans_max_rpm[$i]:-0} -lt $t_rpm ]] && fans_max_rpm[$i]=$t_rpm
-            sleep 0.1
-        done
-        sleep 0.7
-    done
-
-    for i in $(seq 0 $((NUM_FANS - 1))); do
-        local port
-        port=$(get_fan_port "$i")
-        local rpm=${fans_max_rpm[$i]:-0}
-        $OCTOFAN_BIN -m "$port" -v "$rpm" &>/dev/null
-        FAN_MAX_RPM[$i]=$rpm
-        sleep 0.1
-    done
-
-    $OCTOFAN_BIN -r > "$CLI_OUTPUT" 2>/dev/null
-    rm -f "$MAINTENANCE_SEM"
-    show_msg "Recalibration terminee - Max RPM: ${fans_max_rpm[*]}"
-}
-
-################################################################################
-# SCAN DES PORTS - Identifier quels ports controlent des fans reels
-################################################################################
-
-scan_ports() {
-    if [[ $HW_DETECTED -eq 0 ]]; then
-        show_msg "Pas de materiel detecte - scan impossible"
-        return 1
-    fi
-
-    local TEST_SPEED_PCT=40
-    local TEST_PWM
-    TEST_PWM=$(percent_to_pwm "$TEST_SPEED_PCT")
-    local STOP_PWM=0
-    local MAX_PORT=11
-    local detected_ports=()
-
-    clear_screen
-    draw_double_line 70
-    echo -e "${BOLD}${CYAN}  SCAN DES PORTS FAN${NOCOLOR}"
-    draw_double_line 70
-    echo ""
-    echo -e "  Ce test va activer chaque port (0-${MAX_PORT}) a ${TEST_SPEED_PCT}%"
-    echo -e "  un par un pendant 4 secondes."
-    echo -e "  ${YELLOW}Regarde/ecoute quel fan tourne pour chaque port.${NOCOLOR}"
-    echo ""
-    echo -e "  Commandes pendant le test:"
-    echo -e "    ${GREEN}o${NOCOLOR} = OUI, ce port a un fan qui tourne"
-    echo -e "    ${RED}n${NOCOLOR} = NON, rien ne bouge"
-    echo -e "    ${CYAN}Enter${NOCOLOR} = NON (par defaut)"
-    echo -e "    ${YELLOW}q${NOCOLOR} = Annuler le scan"
-    echo ""
-    draw_line 70
-    echo -e "  ${DIM}Appuyez sur une touche pour commencer le scan...${NOCOLOR}"
-    read -rsn1 start_key
-    [[ "$start_key" == "q" || "$start_key" == "Q" ]] && { show_msg "Scan annule"; return 0; }
-
-    # D'abord, tout eteindre
-    echo ""
-    echo -e "  ${DIM}Arret de tous les ports...${NOCOLOR}"
-    for port in $(seq 0 $MAX_PORT); do
-        $OCTOFAN_BIN -f "$port" -v $STOP_PWM &>/dev/null
-        sleep 0.05
-    done
-    sleep 2
-
-    # Scanner chaque port
-    for port in $(seq 0 $MAX_PORT); do
-        echo ""
-        echo -e "  ${BOLD}${YELLOW}>>> Test PORT $port ${NOCOLOR}${DIM}(${TEST_SPEED_PCT}% pendant 4s)${NOCOLOR}"
-
-        # Activer ce port
-        $OCTOFAN_BIN -f "$port" -v "$TEST_PWM" &>/dev/null
-
-        # Attendre 4 secondes avec countdown
-        for countdown in 4 3 2 1; do
-            echo -ne "\r  ${DIM}    Ecoute... ${countdown}s restantes  ${NOCOLOR}"
-            sleep 1
-        done
-        echo ""
-
-        # Couper ce port
-        $OCTOFAN_BIN -f "$port" -v $STOP_PWM &>/dev/null
-
-        # Demander confirmation
-        echo -ne "  ${CYAN}  Port $port: un fan a tourne ? (${GREEN}o${CYAN}=oui / ${RED}n${CYAN}=non / ${YELLOW}q${CYAN}=quitter): ${NOCOLOR}"
-        read -rsn1 answer
-        echo ""
-
-        case "$answer" in
-            o|O|y|Y)
-                detected_ports+=("$port")
-                echo -e "  ${GREEN}  -> Port $port: FAN DETECTE${NOCOLOR}"
-                ;;
-            q|Q)
-                echo -e "  ${YELLOW}  Scan interrompu.${NOCOLOR}"
-                break
-                ;;
-            *)
-                echo -e "  ${DIM}  -> Port $port: rien${NOCOLOR}"
-                ;;
-        esac
-
-        sleep 0.5
-    done
-
-    # Afficher le resultat
-    echo ""
-    draw_line 70
-    echo -e "  ${BOLD}${GREEN}RESULTAT DU SCAN${NOCOLOR}"
-    draw_line 70
-
-    if [[ ${#detected_ports[@]} -eq 0 ]]; then
-        echo -e "  ${RED}Aucun port detecte ! Verifier le branchement.${NOCOLOR}"
-    else
-        echo -e "  ${GREEN}Ports avec fan: ${detected_ports[*]}${NOCOLOR}"
-        echo ""
-
-        # Proposer d'appliquer automatiquement
-        if [[ ${#detected_ports[@]} -ge 1 ]]; then
-            echo -e "  ${CYAN}Appliquer ces ports comme configuration ?${NOCOLOR}"
-            echo -e "    ${GREEN}o${NOCOLOR} = Oui, utiliser ces ports"
-            echo -e "    ${RED}n${NOCOLOR} = Non, garder la config actuelle"
-            echo -ne "  Choix: "
-            read -rsn1 apply_choice
-            echo ""
-
-            if [[ "$apply_choice" == "o" || "$apply_choice" == "O" || "$apply_choice" == "y" || "$apply_choice" == "Y" ]]; then
-                # Appliquer les ports detectes (max 4 fans supportes)
-                local num_detected=${#detected_ports[@]}
-                [[ $num_detected -gt 4 ]] && num_detected=4
-                NUM_FANS=$num_detected
-
-                [[ $num_detected -ge 1 ]] && FAN0_PORT=${detected_ports[0]}
-                [[ $num_detected -ge 2 ]] && FAN1_PORT=${detected_ports[1]}
-                [[ $num_detected -ge 3 ]] && FAN2_PORT=${detected_ports[2]}
-                [[ $num_detected -ge 4 ]] && FAN3_PORT=${detected_ports[3]}
-
-                # Reinitialiser les tableaux
-                CURRENT_SPEEDS=()
-                FAN_RPM=()
-                FAN_MAX_RPM=()
-                FAN_PWM_FACTORS=()
-                for i in $(seq 0 $((NUM_FANS - 1))); do
-                    CURRENT_SPEEDS+=($MANUAL_FAN)
-                    FAN_RPM+=("--")
-                    FAN_MAX_RPM+=("--")
-                    FAN_PWM_FACTORS+=($FAN_PWM_FACTOR)
-                done
-
-                show_msg "Config appliquee: ${NUM_FANS} fans, ports: ${detected_ports[*]}"
-                echo -e "  ${GREEN}Configuration mise a jour !${NOCOLOR}"
-                echo -e "  NUM_FANS=$NUM_FANS"
-                echo -e "  Ports: ${detected_ports[*]}"
-
-                # Remettre les fans detectes en marche
-                apply_all_fans_speed "$MANUAL_FAN"
-            else
-                show_msg "Scan termine - config non modifiee"
+          if [[ $a_fan -eq 100 ]]; then #calc fan increase factor to compensate GPU heat. It can be negative on fanless GPUs
+            ((a_gpus_fan_max_count++))
+            [[ $DEBUG_COMMANDS -ge 1 ]] && echo GPU$i fan is 100%
+            # calc fan speed fot core temp
+            prev_temp=$(jq -r .[$j] <<< $prev_temp_array)
+            if [[ ! -z $prev_temp && $prev_temp -ne 0 ]]; then
+              a_temp=$(jq -r .[$j] <<< $temp_array)
+              [[ $DEBUG_COMMANDS -ge 1 ]] && echo $prev_temp \=\> $a_temp
+              if [[ $(($a_temp - $TARGET_TEMP)) -gt $DEF_TEMP_VARIATION ]]; then
+                if [[ $a_temp -gt $prev_temp ]]; then
+                  ((t_fan_inc_speed=$a_temp - $TARGET_TEMP))
+                elif [[ $a_temp -lt $prev_temp ]]; then
+                  t_fan_inc_speed=-1
+                else
+                  t_fan_inc_speed=0
+                fi
+              else #if [[ $a_temp -lt $TARGET_TEMP ]]; then
+                if [[ $(($TARGET_TEMP - $a_temp)) -gt 3 ]]; then
+                  ((t_fan_inc_speed=$a_temp - $TARGET_TEMP))
+                elif [[ $a_temp -gt $prev_temp ]]; then
+                  ((t_fan_inc_speed=$a_temp - $prev_temp -1))
+                elif [[ $a_temp -lt $prev_temp ]]; then
+                  t_fan_inc_speed=-1
+                else
+                  t_fan_inc_speed=0
+                fi
+              fi
             fi
+            # calc fan speed for mem temp
+            prev_mtemp=$(jq -r .[$j] <<< $prev_mtemp_array)
+            if [[ ! -z $prev_mtemp && $prev_mtemp -ne 0 ]]; then
+              a_mtemp=$(jq -r .[$j] <<< $mtemp_array)
+              [[ $DEBUG_COMMANDS -ge 1 ]] && echo $prev_mtemp \=\> $a_mtemp
+              if [[ $(($a_mtemp - $TARGET_MEM_TEMP)) -gt $DEF_TEMP_VARIATION ]]; then
+                if [[ $a_mtemp -gt $prev_mtemp ]]; then
+                  ((t_fan_inc_speed_m=$a_mtemp - $TARGET_MEM_TEMP))
+                elif [[ $a_mtemp -lt $prev_mtemp ]]; then
+                  t_fan_inc_speed_m=-1
+                else
+                  t_fan_inc_speed_m=0
+                fi
+              else #if [[ $a_temp -lt $TARGET_TEMP ]]; then
+                if [[ $(($TARGET_MEM_TEMP - $a_mtemp)) -gt 3 ]]; then
+                  ((t_fan_inc_speed_m=$a_mtemp - $TARGET_MEM_TEMP))
+                elif [[ $a_mtemp -gt $prev_mtemp ]]; then
+                  ((t_fan_inc_speed_m=$a_mtemp - $prev_mtemp -1))
+                elif [[ $a_mtemp -lt $prev_mtemp ]]; then
+                  t_fan_inc_speed_m=-1
+                else
+                  t_fan_inc_speed_m=0
+                fi
+              fi
+            fi
+            # use the biggest fan speed
+            if [[ -n $t_fan_inc_speed_m ]]; then
+              if [[ $t_fan_inc_speed -lt $t_fan_inc_speed_m ]]; then
+                t_fan_inc_speed=$t_fan_inc_speed_m
+              fi
+            fi
+          fi
         fi
+      done
+      #take max fan_inc_speed factor from cooling GPU
+      [[ ! -z $t_fan_inc_speed && $a_fan_inc_speed -lt $t_fan_inc_speed ]] && a_fan_inc_speed=$t_fan_inc_speed
+    done
+    [[ $a_fan_inc_speed -eq -2000 ]] && a_fan_inc_speed=0
+
+    [[ $CALC_AVERAGE_SPEED == 1 && $n_fan -gt 0 ]] && fan_speed=`expr $s_fan / $n_fan`
+
+    # if none of gpu fan speed is 100% then set a_fan_inc_speed closer to zero
+    [[ $DEBUG_COMMANDS -ge 1 ]] && echo "a_gpus_fan_max_count=$a_gpus_fan_max_count"
+    if [[ $a_gpus_fan_max_count -eq 0 ]]; then
+      if [[ ${FAN_INC_SPEED_FACTORS[$1]} -gt 0 ]]; then
+        [[ $DEBUG_COMMANDS -ge 1 ]] && echo "All GPUs fan speed are lower than 100%. Decreasing FAN_INC_SPEED_FACTORS[$1]"
+        a_fan_inc_speed=-1
+      elif [[ ${FAN_INC_SPEED_FACTORS[$1]} -lt 0 ]]; then
+        [[ $DEBUG_COMMANDS -ge 1 ]] && echo "All GPUs fan speed are lower than 100%. Increasing FAN_INC_SPEED_FACTORS[$1]"
+        a_fan_inc_speed=1
+      else
+        a_fan_inc_speed=0
+      fi
     fi
 
-    # Remettre tous les fans actifs
-    echo ""
-    echo -e "  ${DIM}Remise en marche des fans...${NOCOLOR}"
-    apply_all_fans_speed "$MANUAL_FAN"
+    #add speed factor to compensate gpu overheat
+    ((FAN_INC_SPEED_FACTORS[$1]+=$a_fan_inc_speed * $DEF_FAN_INC_SPEED_STEP))
+    [[ ${FAN_INC_SPEED_FACTORS[$1]} -gt 100 ]] && FAN_INC_SPEED_FACTORS[$1]=100
+    [[ ${FAN_INC_SPEED_FACTORS[$1]} -lt -100 ]] && FAN_INC_SPEED_FACTORS[$1]=-100
+    #[[ ${FAN_INC_SPEED_FACTORS[$1]} -lt 0 ]] && FAN_INC_SPEED_FACTORS[$1]=0
+    #[[ ${FAN_INC_SPEED_FACTORS[$1]} -gt 0 ]] &&
+    ((fan_speed+=${FAN_INC_SPEED_FACTORS[$1]}))
 
-    echo ""
-    draw_line 70
-    echo -e "  ${DIM}Appuyez sur une touche pour revenir...${NOCOLOR}"
-    read -rsn1
+    #adding 10% to fan0 to compensate extra heat from CPU and PSU
+    [[ $1 -eq 0 ]] && ((fan_speed+=10))
+
+    [[ $fan_speed -gt $MAX_FAN ]] && fan_speed=$MAX_FAN
+    [[ $fan_speed -lt $MIN_FAN ]] && fan_speed=$MIN_FAN
+    [[ $fan_speed -gt 100 ]] && fan_speed=100
+  else #error on getting card fan values, setting max speed
+    fan_speed=$MAX_FAN
+  fi
 }
 
-################################################################################
-# SAUVEGARDE / CHARGEMENT DE CONFIG
-################################################################################
-
-save_config() {
-    cat > "$MANAGER_CONF" <<EOF
-AUTO_ENABLED=$AUTO_ENABLED
-MANUAL_FAN=$MANUAL_FAN
-MIN_FAN=$MIN_FAN
-MAX_FAN=$MAX_FAN
-TARGET_TEMP=$TARGET_TEMP
-REFRESH_INTERVAL=$REFRESH_INTERVAL
-FAN0_PORT=$FAN0_PORT
-FAN1_PORT=$FAN1_PORT
-FAN2_PORT=$FAN2_PORT
-FAN3_PORT=$FAN3_PORT
-NUM_FANS=$NUM_FANS
-FAN_PWM_FACTOR=$FAN_PWM_FACTOR
-EOF
-    show_msg "Configuration sauvegardee dans $MANAGER_CONF"
+percent_to_pwm () {
+  local pwm=
+  # [[ -f $OCTOFAN_PERCENT_PWM ]] && pwm=`cat $OCTOFAN_PERCENT_PWM | grep " ${1}%" | head -1 | cut -d " " -f 4`
+  if [ -z $2 ]; then
+    [[ -z $pwm ]] && pwm=`echo $1 $DEF_FAN_PWN_FACTOR| awk '{ printf("%.0f\n",255*$1/100+$2) }'`
+  else
+    [[ -z $pwm ]] && pwm=`echo $1 ${FAN_PWN_FACTORS[$2]}| awk '{ printf("%.0f\n",255*$1/100+$2) }'`
+  fi
+  [[ $pwm -gt 255 ]] && pwm=255
+  [[ $pwm -lt 0 ]] && pwm=0
+  echo $pwm
 }
 
-load_config() {
-    [[ -f "$OCTOFAN_CONF" ]] && source "$OCTOFAN_CONF" 2>/dev/null
-    if [[ -f "$MANAGER_CONF" ]]; then
-        source "$MANAGER_CONF" 2>/dev/null
-        show_msg "Config chargee"
-    fi
+set_fan_speed () {
+  check_sem
+  if [[ $? -eq 0 ]]; then
+    local target_speed=$2
+    [[ $target_speed -gt $MAX_FAN ]] && target_speed=$MAX_FAN
+    [[ $target_speed -lt $MIN_FAN ]] && target_speed=$MIN_FAN
+    fan_id=${FAN_ARRAY[$1]}
+    local pwm=`percent_to_pwm $target_speed $1`
+    echo2 "Setting FAN $1 speed to ${PURPLE}$target_speed%${NOCOLOR}, Min Fan $MIN_FAN%, Max Fan $MAX_FAN%, FAN_ID=$fan_id, PWM=$pwm"
+    [[ ! -z $1 && ! -z $2 ]] && $OCTOFAN_BIN -f $fan_id -v $pwm
+  fi
 }
 
-################################################################################
-# AFFICHAGE
-################################################################################
-
-clear_screen() {
-    printf '\033[2J\033[H'
+set_fans_speed () {
+  check_sem
+  if [[ $? -eq 0 ]]; then
+    if [[ ! -z $1 ]]; then
+      for (( j = 0; j < ${#FAN_ARRAY[@]}; j++ )); do
+      # for j in ${#FAN_ARRAY[@]}; do
+        set_fan_speed $j $1
+      done
+    fi
+  fi
 }
 
-draw_line() {
-    local width=${1:-70}
-    echo -ne "${DIM}"
-    printf '%.0s-' $(seq 1 "$width")
-    echo -e "${NOCOLOR}"
+blink_error () {
+  check_sem
+  [[ $? -ne 0 ]] && return 1 #octofan in maintenance mode
+
+  if [[ $BLINK_ON_ERRORS == 1 ]]; then
+    echo2 "${RED}Blinking LED to show error state${NOCOLOR}"
+
+    $OCTOFAN_BIN -l $BLINK_ON_ERRORS_LED -v $BLINK_ON_ERRORS_TYPE
+  else
+    echo2 "${GREEN}Blink on error disabled, turning off LED${NOCOLOR}"
+
+    $OCTOFAN_BIN -l $BLINK_ON_ERRORS_LED -v $BLINK_OFF_TYPE
+  fi
 }
 
-draw_double_line() {
-    local width=${1:-70}
-    echo -ne "${CYAN}"
-    printf '%.0s=' $(seq 1 "$width")
-    echo -e "${NOCOLOR}"
+blink_warning () {
+  check_sem
+  [[ $? -ne 0 ]] && return 1 #octofan in maintenance mode
+
+  if [[ $BLINK_ON_ERRORS == 1 ]]; then
+    echo2 "${YELLOW}Blinking LED to show warning state${NOCOLOR}"
+
+    $OCTOFAN_BIN -l $BLINK_ON_ERRORS_LED -v $DEF_BLINK_ON_WARNINGS_TYPE
+  else
+    echo2 "${GREEN}Blink on error disabled, turning off LED${NOCOLOR}"
+
+    $OCTOFAN_BIN -l $BLINK_ON_ERRORS_LED -v $BLINK_OFF_TYPE
+  fi
 }
 
-speed_bar() {
-    local pct=$1
-    local width=20
-    local filled=$(( pct * width / 100 ))
-    local empty=$(( width - filled ))
-    local color
+blink_off () {
+  check_sem
+  [[ $? -ne 0 ]] && return 1 #octofan in maintenance mode
 
-    if [[ $pct -ge 80 ]]; then
-        color=$RED
-    elif [[ $pct -ge 50 ]]; then
-        color=$YELLOW
-    else
-        color=$GREEN
-    fi
+  echo2 "${GREEN}Normal state, turning off LED${NOCOLOR}"
 
-    echo -ne "${color}["
-    if [[ $filled -gt 0 ]]; then
-        printf '%.0s#' $(seq 1 "$filled")
-    fi
-    if [[ $empty -gt 0 ]]; then
-        echo -ne "${DIM}"
-        printf '%.0s.' $(seq 1 "$empty")
-        echo -ne "${NOCOLOR}${color}"
-    fi
-    echo -ne "]${NOCOLOR}"
+  $OCTOFAN_BIN -l $BLINK_ON_ERRORS_LED -v $BLINK_OFF_TYPE
 }
 
-color_temp() {
-    local temp=$1
-    if [[ "$temp" == "N/A" || -z "$temp" ]]; then
-        echo -ne "${DIM}N/A${NOCOLOR}"
-        return
-    fi
+blink_to_find () {
+  check_sem
+  [[ $? -ne 0 ]] && return 1 #octofan in maintenance mode
 
-    local t=${temp%.*}
-    t=${t:-0}
+  if [[ $BLINK_TO_FIND == 1 ]]; then
+    echo2 "${WHITE}Turning on LED to find the rig in rack${NOCOLOR}"
 
-    if [[ $t -ge 80 ]]; then
-        echo -ne "${RED}${BOLD}${temp} C${NOCOLOR}"
-    elif [[ $t -ge 65 ]]; then
-        echo -ne "${YELLOW}${temp} C${NOCOLOR}"
-    elif [[ $t -ge 40 ]]; then
-        echo -ne "${GREEN}${temp} C${NOCOLOR}"
-    else
-        echo -ne "${CYAN}${temp} C${NOCOLOR}"
-    fi
+    $OCTOFAN_BIN -l $BLINK_TO_FIND_LED -v $BLINK_TO_FIND_TYPE
+  else
+    $OCTOFAN_BIN -l $BLINK_TO_FIND_LED -v $BLINK_OFF_TYPE
+  fi
 }
 
-draw_dashboard() {
-    clear_screen
+fan_autodetect () {
+  # check_cli_output
 
-    local now
-    now=$(date '+%Y-%m-%d %H:%M:%S')
+  FAN_ARRAY=()
 
-    draw_double_line 70
-    echo -e "${BOLD}${CYAN}  OCTOFAN MANAGER${NOCOLOR}                            ${DIM}$now${NOCOLOR}"
-    draw_double_line 70
+  if [[ -f $CLI_OUTPUT ]]; then
 
-    # Statut hardware
-    if [[ $HW_DETECTED -eq 1 ]]; then
-        echo -ne "  ${GREEN}*${NOCOLOR} Octofan ${GREEN}DETECTE${NOCOLOR}"
-        [[ -n "$HW_VERSION" ]] && echo -ne " ${DIM}HW:$HW_VERSION FW:$FW_VERSION CLI:$CLI_VERSION${NOCOLOR}"
-    else
-        echo -ne "  ${YELLOW}*${NOCOLOR} Mode ${YELLOW}SIMULATION${NOCOLOR}"
-    fi
+    local i=0
+    local j=0
+    local fan_id=
+    local line=
 
-    # Mode
-    if [[ $AUTO_ENABLED -eq 1 ]]; then
-        echo -e "  ${CYAN}[AUTO]${NOCOLOR} Cible: ${BOLD}${TARGET_TEMP}C${NOCOLOR}"
-    else
-        echo -e "  ${PURPLE}[MANUEL]${NOCOLOR} Vitesse: ${BOLD}${MANUAL_FAN}%%${NOCOLOR}"
-    fi
+    for i in {0..11}; do
+      line=`cat $CLI_OUTPUT | grep "FAN No. $i max RPM:"`
+      [[ `echo $line | cut -d " " -f 6` -eq 0 ]] && continue
+      fan_id=`echo $line | cut -d " " -f 3`
+      FAN_ARRAY[$j]=$fan_id
+      ((j++))
+    done
+    [[ ${#FAN_ARRAY[@]} -gt 3 ]] && AUTOFAN_SYNCHRO_MODE=1 #override for x12ultra rigs
+  fi
 
-    draw_line 70
+  if [[ ${#FAN_ARRAY[@]} -eq 0 ]]; then
+    echo_log "$(date +"%Y-%m-%d %T")"
+    echo_log "No casefans detected."
+  fi
+}
 
-    # Section FANS
-    echo -e "\n  ${BOLD}${WHITE}VENTILATEURS${NOCOLOR}"
-    echo -e "  FAN      VITESSE                              RPM      MAX RPM"
-    draw_line 70
+load_def_values () {
+  [[ -f $OCTOFAN_CONF ]] && source $OCTOFAN_CONF
 
-    for i in $(seq 0 $((NUM_FANS - 1))); do
-        local sel_marker=" "
-        if [[ "$SELECTED_FAN" == "$i" ]]; then
-            sel_marker=">"
-        elif [[ "$SELECTED_FAN" == "all" ]]; then
-            sel_marker="*"
-        fi
+  [[ -z $BLINK_ON_ERRORS ]] && BLINK_ON_ERRORS=$DEF_BLINK_ON_ERRORS
+  [[ -z $BLINK_TO_FIND ]] && BLINK_TO_FIND=$DEF_BLINK_TO_FIND
+  [[ -z $MANUAL_FAN ]] && MANUAL_FAN=$DEF_MANUAL_FAN
+  [[ -z $AUTO_ENABLED ]] &&AUTO_ENABLED=$DEF_AUTO_ENABLED
+  [[ -z $MIN_FAN ]] && MIN_FAN=$DEF_MIN_FAN
+  [[ -z $MAX_FAN ]] && MAX_FAN=$DEF_MAX_FAN
+  [[ -z $TARGET_TEMP ]] && TARGET_TEMP=$DEF_TARGET_TEMP
+  [[ -z $TARGET_MEM_TEMP ]] && TARGET_MEM_TEMP=$DEF_TARGET_MEM_TEMP
 
-        local pct=${CURRENT_SPEEDS[$i]:-0}
-        local rpm=${FAN_RPM[$i]:---}
-        local max_rpm=${FAN_MAX_RPM[$i]:---}
-        local port
-        port=$(get_fan_port "$i")
+  [[ -z $BLINK_ON_ERRORS_LED ]] && BLINK_ON_ERRORS_LED=$DEF_BLINK_ON_ERRORS_LED
+  [[ -z $BLINK_ON_ERRORS_TYPE ]] && BLINK_ON_ERRORS_TYPE=$DEF_BLINK_ON_ERRORS_TYPE
+  [[ -z $BLINK_ON_WARNINGS_TYPE ]] && BLINK_ON_WARNINGS_TYPE=$DEF_BLINK_ON_WARNINGS_TYPE
+  [[ -z $BLINK_OFF_TYPE ]] && BLINK_OFF_TYPE=$DEF_BLINK_OFF_TYPE
+  [[ -z $BLINK_TO_FIND_LED ]] && BLINK_TO_FIND_LED=$DEF_BLINK_TO_FIND_LED
+  [[ -z $BLINK_TO_FIND_TYPE ]] && BLINK_TO_FIND_TYPE=$DEF_BLINK_TO_FIND_TYPE
 
-        echo -ne " ${sel_marker} FAN${i}   ${BOLD}$(printf '%3d' "$pct")%%${NOCOLOR}  "
-        speed_bar "$pct"
-        echo -e "  $(printf '%6s' "$rpm")   $(printf '%6s' "$max_rpm")"
+ [[ ${#FAN_ARRAY[@]} -eq 0 ]] && fan_autodetect
+
+  if [[ ${#FAN_PWN_FACTORS[@]} -eq 0 ]]; then
+    for (( i = 0; i < ${#FAN_ARRAY[@]}; i++ )); do
+      [[ -z $FAN_PWN_FACTORS ]] && FAN_PWN_FACTORS[$i]=$DEF_FAN_PWN_FACTOR
+      [[ -z $FAN_INC_SPEED_FACTORS ]] && FAN_INC_SPEED_FACTORS[$i]=0
+    done
+  fi
+}
+
+octo_fan_control () {
+  for (( i = 0; i < ${#FAN_ARRAY[@]}; i++ )); do
+    prev_fan_calc_speeds[$i]=0
+  done
+
+  #main loop
+  while true;  do
+    unset AUTO_ENABLED
+    MIN_FAN=
+    MAX_FAN=
+
+    bus_id_array=
+    fan_array=
+    temp_array=
+    mtemp_array=
+
+    load_def_values
+    SLEEP_TIME=$DEF_SLEEP_TIME
+
+    echo2 "${GREEN}$(date +"%Y-%m-%d %T")${NOCOLOR}"
+
+    while true; do
+      if [ -f $GPU_DETECT_JSON ]; then
+        bus_id_array=(`cat $GPU_DETECT_JSON | jq -c '[ . | to_entries[] | select(.value) | .value.busid [0:2] ]'`)
+        break
+      else
+        echo2 "${RED}No $GPU_DETECT_JSON file exist${NOCOLOR}"
+      fi
+      sleep 10
     done
 
-    echo -e "\n  ${DIM}Plage: ${MIN_FAN}%% - ${MAX_FAN}%%   |   Ports: ${FAN0_PORT}, ${FAN1_PORT}, ${FAN2_PORT}, ${FAN3_PORT}${NOCOLOR}"
-
-    draw_line 70
-
-    # Section TEMPERATURES
-    echo -e "\n  ${BOLD}${WHITE}TEMPERATURES${NOCOLOR}"
-    echo -ne "  Entree (Intake)  : "; color_temp "${TEMPS[0]:-N/A}"; echo
-    echo -ne "  Sortie (Outgoing): "; color_temp "${TEMPS[1]:-N/A}"; echo
-
-    local show_psu_temp=0
-    for idx in 2 3 4; do
-        [[ "${TEMPS[$idx]:-N/A}" != "N/A" ]] && show_psu_temp=1
+    while true; do
+      if [ -f $GPU_STATS_JSON ]; then
+        fan_array=(`cat $GPU_STATS_JSON | tail -1 | jq -c ".fan"`)
+        temp_array=(`cat $GPU_STATS_JSON | tail -1 | jq -c ".temp"`)
+        mtemp_array=(`cat $GPU_STATS_JSON | tail -1 | jq -c ".mtemp"`)
+        break
+      else
+        echo2 "${RED}No $GPU_STATS_JSON file exist${NOCOLOR}"
+      fi
+      sleep 10
     done
 
-    if [[ $show_psu_temp -eq 1 ]]; then
-        echo -ne "  PSU Entree       : "; color_temp "${TEMPS[2]:-N/A}"; echo
-        echo -ne "  PSU Sortie       : "; color_temp "${TEMPS[3]:-N/A}"; echo
-        echo -ne "  PSU Carte        : "; color_temp "${TEMPS[4]:-N/A}"; echo
-    fi
+    #[[ $BLINK_ON_ERRORS == 1 ]] && blink_error
 
-    draw_line 70
-
-    # Section PSU
-    local show_psu=0
-    [[ "$PSU_VAC" != "N/A" && "$PSU_VAC" != "0" ]] && show_psu=1
-    [[ "$PSU_PAC" != "N/A" && "$PSU_PAC" != "0" ]] && show_psu=1
-
-    if [[ $show_psu -eq 1 ]]; then
-        echo -e "\n  ${BOLD}${WHITE}ALIMENTATION (PSU)${NOCOLOR}"
-        echo -e "  AC: ${BOLD}${PSU_VAC}V${NOCOLOR}  |  Puissance: ${BOLD}${YELLOW}${PSU_PAC}W${NOCOLOR}  |  DC: ${BOLD}${PSU_VDC}V${NOCOLOR}"
-        draw_line 70
-    fi
-
-    # Message de dernière commande
-    echo ""
-    local msg_age=$(( $(date +%s) - LAST_CMD_TIME ))
-    if [[ -n "$LAST_CMD_MSG" && $msg_age -lt 10 ]]; then
-        echo -e "  ${GREEN}> ${LAST_CMD_MSG}${NOCOLOR}"
-    fi
-
-    # Menu rapide
-    echo ""
-    draw_line 70
-    echo -e "  ${BOLD}COMMANDES${NOCOLOR}"
-    echo -e "  ${CYAN}h${NOCOLOR}=aide  ${CYAN}a${NOCOLOR}=auto/manuel  ${CYAN}+/-${NOCOLOR}=vitesse  ${CYAN}0-9${NOCOLOR}=vitesse directe"
-    echo -e "  ${CYAN}f${NOCOLOR}=select.fan  ${CYAN}t${NOCOLOR}=temp.cible  ${CYAN}b${NOCOLOR}=scan ports  ${CYAN}s${NOCOLOR}=sauver  ${CYAN}q${NOCOLOR}=quitter"
-    draw_double_line 70
-    echo -ne "  ${DIM}Refresh dans ${REFRESH_INTERVAL}s | Commande: ${NOCOLOR}"
-}
-
-show_help() {
-    clear_screen
-    draw_double_line 70
-    echo -e "${BOLD}${CYAN}  AIDE - OCTOFAN MANAGER${NOCOLOR}"
-    draw_double_line 70
-    echo ""
-    echo -e "  ${BOLD}CONTROLE DES FANS${NOCOLOR}"
-    echo -e "  ${CYAN}a${NOCOLOR}         Basculer mode AUTO / MANUEL"
-    echo -e "  ${CYAN}0-9${NOCOLOR}       Vitesse directe (x10%%, ex: 7 = 70%%)"
-    echo -e "  ${CYAN}+${NOCOLOR}         Augmenter la vitesse de 5%%"
-    echo -e "  ${CYAN}-${NOCOLOR}         Diminuer la vitesse de 5%%"
-    echo -e "  ${CYAN}f${NOCOLOR}         Changer la selection de fan (all/0/1/2/3)"
-    echo -e "  ${CYAN}m${NOCOLOR}         Tous les fans a 100%% (MAX)"
-    echo -e "  ${CYAN}n${NOCOLOR}         Tous les fans au minimum"
-    echo ""
-    echo -e "  ${BOLD}CONFIGURATION${NOCOLOR}"
-    echo -e "  ${CYAN}t${NOCOLOR}         Definir la temperature cible"
-    echo -e "  ${CYAN}i${NOCOLOR}         Definir la vitesse minimale"
-    echo -e "  ${CYAN}x${NOCOLOR}         Definir la vitesse maximale"
-    echo -e "  ${CYAN}p${NOCOLOR}         Modifier les ports de fans"
-    echo -e "  ${CYAN}d${NOCOLOR}         Modifier l'intervalle de refresh"
-    echo ""
-    echo -e "  ${BOLD}ACTIONS${NOCOLOR}"
-    echo -e "  ${CYAN}b${NOCOLOR}         Scanner les ports (identifier les vrais fans)"
-    echo -e "  ${CYAN}r${NOCOLOR}         Recalibrer les fans"
-    echo -e "  ${CYAN}l${NOCOLOR}         Controle LED (on/off/blink)"
-    echo -e "  ${CYAN}s${NOCOLOR}         Sauvegarder la configuration"
-    echo -e "  ${CYAN}c${NOCOLOR}         Afficher la sortie CLI brute"
-    echo -e "  ${CYAN}w${NOCOLOR}         Afficher le log"
-    echo ""
-    echo -e "  ${BOLD}GENERAL${NOCOLOR}"
-    echo -e "  ${CYAN}h${NOCOLOR}         Afficher cette aide"
-    echo -e "  ${CYAN}q${NOCOLOR}         Quitter le manager"
-    echo ""
-    draw_line 70
-    echo -e "  ${DIM}Appuyez sur une touche pour revenir...${NOCOLOR}"
-    read -rsn1
-}
-
-################################################################################
-# LOGIQUE AUTO-FAN
-################################################################################
-
-auto_fan_control() {
-    [[ $AUTO_ENABLED -ne 1 ]] && return
-
-    local intake_temp="${TEMPS[0]:-}"
-    if [[ -z "$intake_temp" || "$intake_temp" == "N/A" ]]; then
-        # Pas de temperature disponible -> securite: MAX
-        apply_all_fans_speed "$MAX_FAN"
-        return
-    fi
-
-    local t=${intake_temp%.*}
-    t=${t:-0}
-
-    local new_speed
-    local sum=0
-    for i in $(seq 0 $((NUM_FANS - 1))); do
-        sum=$(( sum + CURRENT_SPEEDS[$i] ))
-    done
-    local current_avg=$(( sum / NUM_FANS ))
-
-    if [[ $t -ge $(( TARGET_TEMP + 15 )) ]]; then
-        new_speed=100
-    elif [[ $t -ge $(( TARGET_TEMP + 10 )) ]]; then
-        new_speed=90
-    elif [[ $t -ge $(( TARGET_TEMP + 5 )) ]]; then
-        new_speed=80
-    elif [[ $t -ge $TARGET_TEMP ]]; then
-        local diff=$(( t - TARGET_TEMP ))
-        new_speed=$(( current_avg + diff * FAN_INC_SPEED_STEP ))
-    elif [[ $t -ge $(( TARGET_TEMP - 5 )) ]]; then
-        new_speed=$current_avg
-    elif [[ $t -ge $(( TARGET_TEMP - 10 )) ]]; then
-        new_speed=$(( current_avg - FAN_INC_SPEED_STEP ))
-    else
-        new_speed=$MIN_FAN
-    fi
-
-    [[ $new_speed -gt $MAX_FAN ]] && new_speed=$MAX_FAN
-    [[ $new_speed -lt $MIN_FAN ]] && new_speed=$MIN_FAN
-    [[ $new_speed -gt 100 ]] && new_speed=100
-
-    # Fan 0 recoit +10%% pour compenser la chaleur CPU/PSU
-    local fan0_speed=$(( new_speed + 10 ))
-    [[ $fan0_speed -gt 100 ]] && fan0_speed=100
-    [[ $fan0_speed -gt $MAX_FAN ]] && fan0_speed=$MAX_FAN
-
-    apply_fan_speed 0 "$fan0_speed"
-    for i in $(seq 1 $((NUM_FANS - 1))); do
-        apply_fan_speed $i "$new_speed"
-    done
+    #blinking to find the rig in rack
+    blink_to_find
     sleep 0.1
-}
 
-################################################################################
-# TRAITEMENT DES COMMANDES
-################################################################################
+    calc_fan_pwm_factor
 
-set_speed_for_selection() {
-    local speed=$1
-    [[ $speed -gt 100 ]] && speed=100
-    [[ $speed -lt 0 ]] && speed=0
-
-    if [[ "$SELECTED_FAN" == "all" ]]; then
-        apply_all_fans_speed "$speed"
-        MANUAL_FAN=$speed
-        show_msg "Tous les fans regles a ${speed}%%"
-    else
-        apply_fan_speed "$SELECTED_FAN" "$speed"
-        show_msg "FAN${SELECTED_FAN} regle a ${speed}%%"
-    fi
-}
-
-get_current_speed() {
-    if [[ "$SELECTED_FAN" == "all" ]]; then
-        local sum=0
-        for i in $(seq 0 $((NUM_FANS - 1))); do
-            sum=$(( sum + CURRENT_SPEEDS[$i] ))
+    local a_fan=0
+    if [[ $AUTO_ENABLED -eq 1 ]]; then #"autofan" enabled
+      if [[ $AUTOFAN_SYNCHRO_MODE -eq 1 ]]; then
+        [[ $DEBUG_COMMANDS -ge 2 ]] && echo "Autofan is in synchro mode"
+        #if ROH9 is in syncro mode or it's a X12ultra
+        fan_speed=
+        calc_fan_speed "5" #getting current fan speed value
+        [[ $DEBUG_COMMANDS -ge 1 ]] && echo "FANS_INC_SPEED_FACTOR=${FAN_INC_SPEED_FACTORS[5]}"
+        set_fan_speed 0 $(($fan_speed + 10)) #setting current fan speed value
+        prev_fan_calc_speeds[0]=$(($fan_speed + 10))
+        for (( i = 1; i < ${#FAN_ARRAY[@]}; i++ )); do
+          set_fan_speed $i $fan_speed #setting current fan speed value
+          prev_fan_calc_speeds[$i]=$fan_speed
         done
-        echo $(( sum / NUM_FANS ))
+
+      else
+        [[ $DEBUG_COMMANDS -ge 2 ]] && echo "Autofan is in ROH9 mode"
+        for i in {0..2}; do
+          fan_speed=
+          calc_fan_speed $i #getting current fan speed value
+          [[ $DEBUG_COMMANDS -ge 1 ]] && echo "FAN${i}_INC_SPEED_FACTOR=${FAN_INC_SPEED_FACTORS[$i]}"
+          set_fan_speed $i $fan_speed #setting current fan speed value
+          prev_fan_calc_speeds[$i]=$fan_speed
+          sleep 0.1
+        done
+      fi
     else
-        echo "${CURRENT_SPEEDS[$SELECTED_FAN]}"
-    fi
-}
-
-process_command() {
-    local cmd="$1"
-
-    case "$cmd" in
-        h|H|\?)
-            show_help
-            ;;
-        q|Q)
-            RUNNING=0
-            ;;
-        a|A)
-            if [[ $AUTO_ENABLED -eq 1 ]]; then
-                AUTO_ENABLED=0
-                show_msg "Mode MANUEL active - vitesse: ${MANUAL_FAN}%%"
-                apply_all_fans_speed "$MANUAL_FAN"
-            else
-                AUTO_ENABLED=1
-                show_msg "Mode AUTO active - cible: ${TARGET_TEMP}C"
-            fi
-            ;;
-        [0-9])
-            AUTO_ENABLED=0
-            local speed=$(( cmd * 10 ))
-            [[ $speed -eq 0 ]] && speed=100
-            set_speed_for_selection "$speed"
-            ;;
-        +|=)
-            AUTO_ENABLED=0
-            local cur
-            cur=$(get_current_speed)
-            set_speed_for_selection $(( cur + 5 ))
-            ;;
-        -|_)
-            AUTO_ENABLED=0
-            local cur
-            cur=$(get_current_speed)
-            set_speed_for_selection $(( cur - 5 ))
-            ;;
-        f|F)
-            case "$SELECTED_FAN" in
-                all) SELECTED_FAN=0; show_msg "Fan selectionne: FAN0" ;;
-                0) SELECTED_FAN=1; show_msg "Fan selectionne: FAN1" ;;
-                1) SELECTED_FAN=2; show_msg "Fan selectionne: FAN2" ;;
-                2) SELECTED_FAN=3; show_msg "Fan selectionne: FAN3" ;;
-                3) SELECTED_FAN="all"; show_msg "Fan selectionne: TOUS" ;;
-            esac
-            ;;
-        m|M)
-            AUTO_ENABLED=0
-            apply_all_fans_speed 100
-            MANUAL_FAN=100
-            show_msg "Tous les fans a 100%% MAX"
-            ;;
-        n|N)
-            AUTO_ENABLED=0
-            apply_all_fans_speed "$MIN_FAN"
-            MANUAL_FAN=$MIN_FAN
-            show_msg "Tous les fans au minimum ${MIN_FAN}%%"
-            ;;
-        t|T)
-            echo ""
-            echo -e "  ${CYAN}Temperature cible actuelle: ${TARGET_TEMP}C${NOCOLOR}"
-            echo -ne "  Nouvelle valeur (30-90): "
-            read -r new_temp
-            if [[ "$new_temp" =~ ^[0-9]+$ ]] && [[ $new_temp -ge 30 ]] && [[ $new_temp -le 90 ]]; then
-                TARGET_TEMP=$new_temp
-                show_msg "Temperature cible: ${TARGET_TEMP}C"
-            else
-                show_msg "Valeur invalide, entrer 30-90"
-            fi
-            ;;
-        i|I)
-            echo ""
-            echo -e "  ${CYAN}Vitesse minimale actuelle: ${MIN_FAN}%%${NOCOLOR}"
-            echo -ne "  Nouvelle valeur (0-100): "
-            read -r new_min
-            if [[ "$new_min" =~ ^[0-9]+$ ]] && [[ $new_min -ge 0 ]] && [[ $new_min -le 100 ]]; then
-                MIN_FAN=$new_min
-                show_msg "Vitesse minimale: ${MIN_FAN}%%"
-            else
-                show_msg "Valeur invalide, entrer 0-100"
-            fi
-            ;;
-        x|X)
-            echo ""
-            echo -e "  ${CYAN}Vitesse maximale actuelle: ${MAX_FAN}%%${NOCOLOR}"
-            echo -ne "  Nouvelle valeur (0-100): "
-            read -r new_max
-            if [[ "$new_max" =~ ^[0-9]+$ ]] && [[ $new_max -ge 0 ]] && [[ $new_max -le 100 ]]; then
-                MAX_FAN=$new_max
-                show_msg "Vitesse maximale: ${MAX_FAN}%%"
-            else
-                show_msg "Valeur invalide, entrer 0-100"
-            fi
-            ;;
-        p|P)
-            echo ""
-            echo -e "  ${CYAN}Ports actuels: FAN0=${FAN0_PORT}, FAN1=${FAN1_PORT}, FAN2=${FAN2_PORT}, FAN3=${FAN3_PORT}${NOCOLOR}"
-            echo -ne "  Port FAN0 (Enter=garder): "; read -r p0
-            [[ -n "$p0" ]] && FAN0_PORT=$p0
-            echo -ne "  Port FAN1 (Enter=garder): "; read -r p1
-            [[ -n "$p1" ]] && FAN1_PORT=$p1
-            echo -ne "  Port FAN2 (Enter=garder): "; read -r p2
-            [[ -n "$p2" ]] && FAN2_PORT=$p2
-            echo -ne "  Port FAN3 (Enter=garder): "; read -r p3
-            [[ -n "$p3" ]] && FAN3_PORT=$p3
-            show_msg "Ports: ${FAN0_PORT}, ${FAN1_PORT}, ${FAN2_PORT}, ${FAN3_PORT}"
-            ;;
-        d|D)
-            echo ""
-            echo -e "  ${CYAN}Intervalle actuel: ${REFRESH_INTERVAL}s${NOCOLOR}"
-            echo -ne "  Nouvelle valeur (1-60): "
-            read -r new_int
-            if [[ "$new_int" =~ ^[0-9]+$ ]] && [[ $new_int -ge 1 ]] && [[ $new_int -le 60 ]]; then
-                REFRESH_INTERVAL=$new_int
-                show_msg "Intervalle: ${REFRESH_INTERVAL}s"
-            else
-                show_msg "Valeur invalide, entrer 1-60"
-            fi
-            ;;
-        b|B)
-            scan_ports
-            ;;
-        r|R)
-            recalibrate_fans
-            ;;
-        l|L)
-            echo ""
-            echo -e "  ${CYAN}Controle LED${NOCOLOR}"
-            echo -e "  ${CYAN}1${NOCOLOR}=LED Orange ON  ${CYAN}2${NOCOLOR}=LED Bleue ON  ${CYAN}3${NOCOLOR}=LED Blanche ON"
-            echo -e "  ${CYAN}4${NOCOLOR}=Blink rapide   ${CYAN}5${NOCOLOR}=Blink lent    ${CYAN}0${NOCOLOR}=Toutes OFF"
-            echo -ne "  Choix: "
-            read -rsn1 led_cmd
-            echo
-            case "$led_cmd" in
-                1) set_led 0 1; show_msg "LED Orange allumee" ;;
-                2) set_led 1 1; show_msg "LED Bleue allumee" ;;
-                3) set_led 2 1; show_msg "LED Blanche allumee" ;;
-                4) for l in 0 1 2; do set_led "$l" 2; done; show_msg "Toutes LED blink rapide" ;;
-                5) for l in 0 1 2; do set_led "$l" 3; done; show_msg "Toutes LED blink lent" ;;
-                0) for l in 0 1 2; do set_led "$l" 0; done; show_msg "Toutes LED eteintes" ;;
-                *) show_msg "Commande LED invalide" ;;
-            esac
-            ;;
-        s|S)
-            save_config
-            ;;
-        c|C)
-            if [[ -f "$CLI_OUTPUT" ]]; then
-                clear_screen
-                echo -e "${BOLD}${CYAN}  SORTIE CLI BRUTE${NOCOLOR}"
-                draw_line 70
-                cat "$CLI_OUTPUT"
-                draw_line 70
-                echo -e "\n  ${DIM}Appuyez sur une touche pour revenir...${NOCOLOR}"
-                read -rsn1
-            else
-                show_msg "Pas de donnees CLI"
-            fi
-            ;;
-        w|W)
-            if [[ -f "$LOG_FILE" ]]; then
-                clear_screen
-                echo -e "${BOLD}${CYAN}  LOG (30 dernieres lignes)${NOCOLOR}"
-                draw_line 70
-                tail -30 "$LOG_FILE"
-                draw_line 70
-                echo -e "\n  ${DIM}Appuyez sur une touche pour revenir...${NOCOLOR}"
-                read -rsn1
-            else
-                show_msg "Pas de log"
-            fi
-            ;;
-        "")
-            ;;
-        *)
-            show_msg "Commande inconnue: $cmd - tapez h pour aide"
-            ;;
-    esac
-}
-
-################################################################################
-# GESTION PROPRE DE L'ARRET
-################################################################################
-
-cleanup() {
-    echo ""
-    echo -e "${YELLOW}Arret du manager...${NOCOLOR}"
-
-    if [[ $HW_DETECTED -eq 1 ]]; then
-        echo -e "Fans regles a ${MAX_FAN}%% par securite..."
-        apply_all_fans_speed "$MAX_FAN"
+      [[ $DEBUG_COMMANDS -ge 2 ]] && echo "Manual fan mode"
+      if [[ ! -z $MANUAL_FAN ]]; then
+        set_fans_speed $MANUAL_FAN #setting all fans speed to manual value
+        for (( i = 0; i < ${#FAN_ARRAY[@]}; i++ )); do
+          prev_fan_calc_speeds[$i]=$MANUAL_FAN
+        done
+        # prev_fan_calc_speeds=($MANUAL_FAN $MANUAL_FAN $MANUAL_FAN)
+      else
+        set_fans_speed 100 #can't get manual value, setting all fans speed to 100%
+        for (( i = 0; i < ${#FAN_ARRAY[@]}; i++ )); do
+          prev_fan_calc_speeds[$i]=100
+        done
+        # prev_fan_calc_speeds=(100 100 100)
+      fi
     fi
 
-    save_config 2>/dev/null
-    log_msg "Manager arrete"
-    echo -e "${GREEN}Manager arrete. Fans a ${MAX_FAN}%%.${NOCOLOR}"
-    exit 0
+    prev_temp_array=$temp_array
+    prev_mtemp_array=$mtemp_array
+
+    read -t $SLEEP_TIME
+  done
 }
 
-trap cleanup SIGINT SIGTERM
+calc_fan_pwm_factor () {
+  check_cli_output
 
-################################################################################
-# BOUCLE PRINCIPALE
-################################################################################
+  for (( i = 0; i < ${#FAN_ARRAY[@]}; i++ )); do
+    FAN_ID=${FAN_ARRAY[$i]}
+    fan_target_speed=${prev_fan_calc_speeds[$i]}
+    fan_current_speed=`cat $CLI_OUTPUT | grep "FAN No. $FAN_ID RPM in percent:" | cut -d " " -f 7`
+    [[ $DEBUG_COMMANDS -ge 2 ]] && echo "FAN_ID=$FAN_ID | fan_target_speed=$fan_target_speed | fan_current_speed=$fan_current_speed"
+    if [ $fan_target_speed -eq 100 ]; then
+      FAN_PWN_FACTORS[$i]=0
+      echo2 "Reseting FAN$i PWM factor"
+    # elif [[ $fan_target_speed -gt 0 && $fan_current_speed -gt 0 ]]; then
+    elif [[ $fan_target_speed -gt 0 || $fan_curent_speed -gt 0 ]]; then
+      [[ $fan_current_speed -lt $fan_target_speed ]] && ((FAN_PWN_FACTORS[$i]+=$fan_target_speed-$fan_current_speed)) && echo2 "Increasing FAN$i PWM factor"
+      [[ $fan_current_speed -gt $fan_target_speed ]] && ((FAN_PWN_FACTORS[$i]+=$fan_target_speed-$fan_current_speed)) && echo2 "Decreasing FAN$i PWM factor"
+    fi
+    [[ ${FAN_PWN_FACTORS[$i]} -lt -100 || ${FAN_PWN_FACTORS[$i]} -gt 100 ]] && FAN_PWN_FACTORS[$i]=0 && echo2 "Reseting FAN$i PWM factor"
+  done
 
-main() {
-    log_msg "=== Demarrage octofan-manager ==="
+  [[ $DEBUG_COMMANDS -ge 1 ]] && echo "FAN_PWN_FACTORS: ${FAN_PWN_FACTORS[@]}"
+}
 
-    load_config
-    detect_hardware
+get_file_time_diff () {
+  local a=999
+  [[ -f $CLI_OUTPUT ]] && let a=`date +%s`-`stat --format='%Y' $CLI_OUTPUT`
+  echo $a
+}
 
-    if [[ $HW_DETECTED -eq 1 ]]; then
-        log_msg "Octofan detecte HW:$HW_VERSION FW:$FW_VERSION CLI:$CLI_VERSION"
-        parse_cli_data
-        # Securite: fans a MANUAL_FAN au demarrage
-        apply_all_fans_speed "$MANUAL_FAN"
-        CURRENT_SPEEDS=($MANUAL_FAN $MANUAL_FAN $MANUAL_FAN $MANUAL_FAN)
-        log_msg "Fans initialises a ${MANUAL_FAN}%%"
+check_cli_output () {
+  local i=0
+  if [[ `get_file_time_diff` -gt 5 ]]; then
+    $OCTOFAN_BIN -r > "$CLI_TMP_OUTPUT"
+    if [[ `cat "$CLI_TMP_OUTPUT" | grep -c "Serial No: "` -eq 1 ]]; then
+      mv "$CLI_TMP_OUTPUT" $CLI_OUTPUT >> /dev/null
+      echo "" > "$CLI_ERROR_COUNTER"
     else
-        log_msg "Pas de materiel Octofan - mode simulation"
-        CURRENT_SPEEDS=(50 50 50 50)
-        TEMPS=(42 48 35 40 38)
-        PSU_VAC=230
-        PSU_PAC=850
-        PSU_VDC=12
+      echo "error getting cli output" >> "$CLI_ERROR_COUNTER"
     fi
 
-    while [[ $RUNNING -eq 1 ]]; do
-        # Lire les données hardware
-        if [[ $HW_DETECTED -eq 1 ]]; then
-            read_cli_data
-            parse_cli_data
+    [[ `cat "$CLI_ERROR_COUNTER" | grep -c "error getting cli output"` -gt 50 ]] && echo "" > $CLI_OUTPUT
+  fi
+}
+
+# get_temp () {
+#   check_cli_output
+#
+#   local temp=`cat $CLI_OUTPUT | grep "Temperature No. $1" | cut -d " " -f 5`
+#
+#   [[ $temp != "" ]] && echo ${temps[@]} | tr " " "\n" | jq -cs '.' || echo 255
+# }
+
+get_temp_json () {
+  # check_cli_output
+
+  # local temps=
+  # for i in {0..4}; do
+  #   temps+=`cat $CLI_OUTPUT | grep "Temperature No. $i" | cut -d " " -f 5`" "
+  # done
+  local t_value
+  if [[ -f $CLI_OUTPUT ]]; then
+    #if there is BME280 #0 Climate sensor, than take its temperature:
+    t_value=`cat $CLI_OUTPUT | grep "BME280 No. 0 Temp: " | cut -d " " -f 5`
+    if [[ ! -z $t_value && $t_value != '-nan' ]]; then
+      temps+="$t_value "
+    else
+      temps+=`cat $CLI_OUTPUT | grep "Temperature No. 0" | cut -d " " -f 5`" " #in
+    fi
+    t_value=`cat $CLI_OUTPUT | grep "BME280 No. 1 Temp: " | cut -d " " -f 5`
+    if [[ ! -z $t_value && $t_value != '-nan' ]]; then
+      temps+="$t_value "
+    else
+      temps+=`cat $CLI_OUTPUT | grep "Temperature No. 1" | cut -d " " -f 5`" " #out
+    fi
+    local psu_count=`cat $CLI_OUTPUT | grep "PSU No." | tail -1 | cut -d " " -f 4`
+    if [[ ! -z $psu_count ]]; then
+      temps+=`cat $CLI_OUTPUT | grep "PSU" | grep "T1:" | cut -d " " -f 6 | awk '{sum+=$1} END { printf "%.2f", sum/NR }'`" " #mean intake temp
+      temps+=`cat $CLI_OUTPUT | grep "PSU" | grep "T2:" | cut -d " " -f 6 | awk '{sum+=$1} END { printf "%.2f", sum/NR }'` #mean exhast temp
+      # temps+=`cat $CLI_OUTPUT | grep "PSU T1:" | cut -d " " -f 4`" " #psu intake temp
+      # temps+=`cat $CLI_OUTPUT | grep "PSU T2:" | cut -d " " -f 4`" " #psu exhast temp
+      #temps+=`cat $CLI_OUTPUT | grep "PSU T3:" | cut -d " " -f 4`" " #psu board temp
+    fi
+
+    echo ${temps[@]} | tr " " "\n" | jq -cs '.'
+  else
+    echo "[]"
+  fi
+}
+
+get_psu_json () {
+  # check_cli_output
+  if [[ -f $CLI_OUTPUT ]]; then
+    voltage_ac=0; power_ac=0; voltage_dc=0
+    result_json='{"units": []}'
+    #get number of PSUs
+    local psu_count=`cat $CLI_OUTPUT | grep "PSU No." | tail -1 | cut -d " " -f 4`
+    if [[ -z $psu_count ]]; then
+      echo "{}"
+      return 1
+    fi
+
+    for (( i = 0; i <= $psu_count; i++ )); do
+      local t_model=`cat $CLI_OUTPUT | grep "PSU No. $i" | tail -1 | cut -d " " -f 1`
+      [[ -z $t_model ]] && continue
+      local t_voltage_ac=`cat $CLI_OUTPUT | grep "PSU No. $i Vac:" | cut -d " " -f 6`
+      [[ -z $t_voltage_ac ]] && t_voltage_ac=0
+      local t_power_ac=`cat $CLI_OUTPUT | grep "PSU No. $i Pac:" | cut -d " " -f 6`
+      [[ -z $t_power_ac ]] && t_power_ac=0
+      local t_voltage_dc=`cat $CLI_OUTPUT | grep "PSU No. $i Vdc:" | cut -d " " -f 6`
+      [[ -z $t_voltage_dc ]] && t_voltage_dc=0
+      # local t_temp_in=`cat $CLI_OUTPUT | grep "PSU No. $i T1:" | cut -d " " -f 6`
+      # [[ -z $t_temp_in ]] && t_temp_in=0
+      # local t_temp_out=`cat $CLI_OUTPUT | grep "PSU No. $i T2:" | cut -d " " -f 6`
+      # [[ -z $t_temp_out ]] && t_temp_out=0
+      # local amperage_ac=`cat $CLI_OUTPUT | grep "PSU Iac:" | cut -d " " -f 4`
+      # local amperage_dc=`cat $CLI_OUTPUT | grep "PSU Idc:" | cut -d " " -f 4`
+      # local power_dc=`cat $CLI_OUTPUT | grep "PSU Pdc:" | cut -d " " -f 4`
+
+      # Normalize PSU power
+      if (( `echo "$t_power_ac < 30" | bc -l` && `echo "$t_power_ac != 0" | bc -l` )); then
+        if [[ -f ${PSU_LAST_POWER_FILENAME}_$i ]]; then
+          a=0
+          let a=`date +%s`-`stat --format='%Y' ${PSU_LAST_POWER_FILENAME}_$i`
+          [[ a -le 60 ]] &&  t_power_ac=`cat ${PSU_LAST_POWER_FILENAME}_$i | tail -1` || t_power_ac=0
+        else
+          t_power_ac=0
         fi
+      else
+        echo $t_power_ac > ${PSU_LAST_POWER_FILENAME}_$i
+      fi
+      [[ -z $t_power_ac ]] && t_power_ac=0
 
-        # Contrôle auto des fans
-        [[ $AUTO_ENABLED -eq 1 ]] && auto_fan_control
+      voltage_ac=`echo "scale=1;$voltage_ac + $t_voltage_ac" | bc`
+      power_ac=`echo "scale=1;$power_ac + $t_power_ac" | bc`
+      voltage_dc=`echo "scale=1;$voltage_dc + $t_voltage_dc" | bc`
+      result_json=`jq '.units += [{"id": '$i',
+                                   "model": "'$t_model'",
+                                   "power_ac": '$t_power_ac',
+                                   "voltage_ac": '$t_voltage_ac',
+                                   "voltage_dc": '$t_voltage_dc'}]' <<< $result_json`
 
-        # Afficher le dashboard
-        draw_dashboard
-
-        # Attendre une commande
-        local cmd=""
-        read -rsn1 -t "$REFRESH_INTERVAL" cmd
-
-        [[ -n "$cmd" ]] && process_command "$cmd"
+                                   # "temp_in": '$t_temp_in',
+                                   # "temp_out": '$t_temp_out'
     done
 
-    cleanup
+    # calc mean values
+    if [[ $psu_count -gt 0 ]]; then
+      voltage_ac=`echo "scale=1;$voltage_ac / ($psu_count + 1)" | bc`
+      voltage_dc=`echo "scale=1;$voltage_dc / ($psu_count + 1)" | bc`
+    fi
+
+    # jq -cns \
+    #    --arg voltage_ac $voltage_ac \
+    #    --arg amperage_ac $amperage_ac \
+    #    --arg power_ac $power_ac \
+    #    --arg voltage_dc $voltage_dc \
+    #    --arg amperage_dc $amperage_dc \
+    #    --arg power_dc $power_dc \
+    #    '{$voltage_ac, $amperage_ac, $power_ac, $voltage_dc, $amperage_dc, $power_dc}'
+
+    t_json='{"power_ac": '$power_ac', "voltage_ac": '$voltage_ac', "voltage_dc": '$voltage_dc'}'
+    jq -s '.[0] * .[1]' <<< "$result_json $t_json"
+  else
+    echo "{}"
+  fi
 }
 
-################################################################################
-# POINT D'ENTREE
-################################################################################
+get_fan_json_percent () {
+  # check_cli_output
+  if [[ -f $CLI_OUTPUT ]]; then
+    local fans=
+    local fan=0
+    for j in {0..11}; do
+      local fan_max_rpm=`cat $CLI_OUTPUT | grep "FAN No. $j max RPM:" | cut -f 6 -d " "`
+      [[ -z $fan_max_rpm || $fan_max_rpm == '-nan' || $fan_max_rpm -eq 0 ]] && continue
 
-case "${1:-}" in
-    --help|-h)
-        echo "Usage: sudo $(basename "$0") [OPTIONS]"
-        echo ""
-        echo "Script interactif de gestion de ventilation Octominer."
-        echo "Compatible HW v1.2 / FW 3.0 / CLI 1.7"
-        echo ""
-        echo "OPTIONS:"
-        echo "  --help, -h     Afficher cette aide"
-        echo "  --screen       Lancer dans un screen detache"
-        echo "  --status       Afficher le statut et quitter"
-        echo "  --set-speed N  Regler tous les fans a N%% et quitter"
-        echo "  --max          Regler tous les fans a 100%% et quitter"
-        echo "  --min          Regler tous les fans au minimum et quitter"
-        echo ""
-        echo "Lancement recommande:"
-        echo "  sudo screen -S fanctl $(basename "$0")"
-        echo "  (Ctrl+A, D pour detacher le screen)"
-        echo ""
-        exit 0
-        ;;
-    --screen)
-        exec screen -dmS fanctl "$0"
-        echo "Screen 'fanctl' demarre. Rejoindre avec: screen -r fanctl"
-        exit 0
-        ;;
-    --status)
-        detect_hardware
-        load_config
-        if [[ $HW_DETECTED -eq 1 ]]; then
-            parse_cli_data
-            echo "Hardware: Detecte HW:$HW_VERSION FW:$FW_VERSION CLI:$CLI_VERSION"
-            echo "Fans: ${CURRENT_SPEEDS[0]}%% ${CURRENT_SPEEDS[1]}%% ${CURRENT_SPEEDS[2]}%%"
-            echo "RPM:  ${FAN_RPM[0]} ${FAN_RPM[1]} ${FAN_RPM[2]}"
-            echo "Temp: Intake=${TEMPS[0]:-N/A} Outgoing=${TEMPS[1]:-N/A}"
-            echo "PSU:  ${PSU_PAC}W  ${PSU_VAC}Vac  ${PSU_VDC}Vdc"
-        else
-            echo "Hardware: Non detecte"
+      fan=`cat $CLI_OUTPUT | grep "FAN No. $j RPM in percent:" | cut -d " " -f 7`
+      fans+=$fan" "
+    done
+
+    echo ${fans[@]} | tr " " "\n" | jq -cs '.'
+  else
+    echo "[]"
+  fi
+}
+
+get_bme_json () {
+  #[{"id": 0, "model": "BME280", "humid": 26.54, "press": 1014.12}, {"id": 1, "model": "BME280", "humid": 28.72, "press": 1013.49}]
+  if [[ -f $CLI_OUTPUT ]]; then
+    local bme_result
+    local bme_count=`cat $CLI_OUTPUT | grep "BME" | tail -1 | cut -d " " -f 3`
+    if [[ ! -z $bme_count ]]; then
+      for (( i = 0; i <= $bme_count; i++ )); do
+        local model=`cat $CLI_OUTPUT | grep "BME" | grep " No. $i Humid: " | cut -d " " -f 1`
+        local humid=`cat $CLI_OUTPUT | grep "BME" | grep " No. $i Humid: " | cut -d " " -f 5`
+        local press=`cat $CLI_OUTPUT | grep "BME" | grep " No. $i Press: " | cut -d " " -f 5`
+        bme_result+=${bme_result:+,}'{"id": '$i', "model": "'$model'", "humid": '$humid', "press": '$press'}'
+      done
+    fi
+    echo "[$bme_result]" | jq -c '.'
+  else
+    echo "[]"
+  fi
+}
+
+check_avrdude () {
+  if [[ `dpkg -s avrdude 2>/dev/null | grep -c "ok installed"` -eq 0 ]]; then
+    [[ -f "/etc/avrdude.conf" ]] && rm -f "/etc/avrdude.conf"
+    apt-get install -y avrdude
+#    cp /hive/opt/octofan/avrdude.conf   /etc/avrdude.conf
+  fi
+}
+
+check_snmpd () {
+  if [[ `dpkg -s snmpd 2>/dev/null | grep -c "ok installed"` -eq 0 ]]; then
+    [[ -f "/etc/snmp/snmpd.conf" ]] && rm -f "/etc/snmp/snmpd.conf"
+    apt-get install -y snmpd
+    if [[ ! -L /etc/snmp/snmpd.conf ]]; then #check for symlink
+      mv /etc/snmp/snmpd.conf /etc/snmp/snmpd~.conf
+      ln -sf /hive/etc/snmpd.conf /etc/snmp/snmpd.conf
+    fi
+    service snmpd restart
+  fi
+}
+
+update_fw () {
+  #check settings
+  [[ -z $FW_FILENAME ]] && echo "FW_FILENAME is empty" && return 1
+  [[ -z $FIRMWARE_MD5 ]] && echo "FIRMWARE_MD5 is empty" && return 1
+  [[ -z $FW_VERSION ]] && echo "FW_VERSION is empty" && return 1
+
+  echo "$(date +"%Y-%m-%d %T") - update firmware" > $MAINTENANCE_SEM_NAME
+
+  echo2 "${GREEN}$(date +"%Y-%m-%d %T")${NOCOLOR}"
+  echo2 "Updating fan controller firmware | FW_FILENAME=$FW_FILENAME | FW_VERSION=$FW_VERSION | FIRMWARE_MD5=$FIRMWARE_MD5 |"
+  echo2 "Checking firmware MD5 sum"
+
+  local fw_sum="null"
+  fw_sum=`md5sum $FW_FILENAME | cut -f 1 -d " "`
+  if [[ ! $FIRMWARE_MD5 == $fw_sum ]]; then
+    echo2 "Firmware MD5 sum mismatch. ${RED}Firmware update aborted.${NOCOLOR}"
+    rm -f ${MAINTENANCE_SEM_NAME}
+    return 1
+  else
+
+    local error_txt=
+    local t_error_txt=
+    local bl_enter=0
+    local error=0
+
+    local bin_dir=`dirname "$OCTOFAN_BIN"`
+    cd $bin_dir
+
+    echo2 "${GREEN}$(date +"%Y-%m-%d %T")${NOCOLOR}"
+    echo2 "Stopping miner"
+    miner stop
+    sleep 10
+
+    echo2 "${GREEN}$(date +"%Y-%m-%d %T")${NOCOLOR}"
+    echo2 "Entering bootloader"
+    t_error_txt=`$OCTOFAN_BIN -b 2>&1`
+    if [[ $? -ne 0 ]]; then
+      error=1
+      error_txt+="$(date +"%Y-%m-%d %T") Error on entering bootloader: $t_error_txt "
+    else
+      bl_enter=1
+    fi
+    sleep 1
+
+    if [[ $bl_enter == 1 ]]; then
+      cp /hive/opt/octofan/avrdude.conf /etc/avrdude.conf
+      echo2 "${GREEN}$(date +"%Y-%m-%d %T")${NOCOLOR}"
+      echo2 "Flashing the firmware $FW_FILENAME"
+
+      #echo2 "/usr/bin/avrdude -pm328pb -cusbasp -Uflash:w:$FW_FILENAME:a"
+      #t_error_txt=`/usr/bin/avrdude -pm328pb -cusbasp -Uflash:w:$FW_FILENAME:a 2>&1`
+      #echo2 "/usr/bin/avrdude -pm324pb -cusbasp -U lfuse:w:0xff:m -U hfuse:w:0xd8:m -U efuse:w:0xfd:m -U flash:w:$FW_FILENAME:a"
+      #t_error_txt=`/usr/bin/avrdude -pm324pb -cusbasp -U lfuse:w:0xff:m -U hfuse:w:0xd8:m -U efuse:w:0xfd:m -U flash:w:$FW_FILENAME:a 2>&1`
+      echo2 "/usr/bin/avrdude -pm324pb -cusbasp -U flash:w:$FW_FILENAME:a"
+      t_error_txt=`/usr/bin/avrdude -pm324pb -cusbasp -U flash:w:$FW_FILENAME:a 2>&1`
+      if [[ $? -ne 0 ]]; then
+        #one more try
+        t_error_txt=`/usr/bin/avrdude -pm324pb -cusbasp -U flash:w:$FW_FILENAME:a 2>&1`
+        if [[ $? -ne 0 ]]; then
+          error=1
+          error_txt+="$(date +"%Y-%m-%d %T") Error on flashing firmware: $t_error_txt "
         fi
-        echo "Mode: $([ $AUTO_ENABLED -eq 1 ] && echo AUTO || echo MANUEL)"
-        echo "Config: Min=${MIN_FAN}%% Max=${MAX_FAN}%% Target=${TARGET_TEMP}C"
-        exit 0
-        ;;
-    --set-speed)
-        if [[ -z "${2:-}" ]]; then
-            echo "Usage: sudo $0 --set-speed <0-100>"
-            exit 1
+      fi
+      sleep 3
+    fi
+
+     echo2 "${GREEN}$(date +"%Y-%m-%d %T")${NOCOLOR}"
+     echo2 "Exiting bootloader"
+     t_error_txt=`$OCTOFAN_BIN -bx 2>&1`
+     if [[ $? -ne 0 ]]; then
+       error=1
+       error_txt+="$(date +"%Y-%m-%d %T") Error on exiting bootloader: $t_error_txt "
+     fi
+     sleep 3
+
+    #checking firmvare
+    echo2 "Checking firmware"
+    local fw_cur_ver=`$OCTOFAN_BIN -r | grep "VERSION-FW:" | cut -f 2 -d " "`
+    dpkg --compare-versions "$FW_VERSION" "le" "$fw_cur_ver"
+    if [ $? -ne "0" ]; then
+      error=1
+      error_txt+="$(date +"%Y-%m-%d %T") Firmware not updated, current version: $fw_cur_ver "
+    fi
+    sleep 3
+
+
+    echo2 "${GREEN}$(date +"%Y-%m-%d %T")${NOCOLOR}"
+    echo2 "Starting miner"
+    miner start
+    sleep 3
+
+    #maintenance sem remooving in recalibrate_fans function
+    recalibrate_fans
+
+    if [[ $error == 0 ]]; then
+
+      save_text_to_EEPROM
+
+      echo2 ""
+      echo2 "${GREEN}$(date +"%Y-%m-%d %T")${NOCOLOR}"
+      echo2 "Done"
+    else
+      error_txt="Error on updating fan controller firmware: $error_txt"
+      /hive/bin/message danger "$error_txt"
+    fi
+  fi
+}
+
+test_max_rpm () {
+  echo2 "${GREEN}$(date +"%Y-%m-%d %T")${NOCOLOR}"
+  echo2 "Testing max fans RPM"
+
+  $OCTOFAN_BIN -t
+  # for (( i=1; i<=70; i++)); do
+  #   echo -n '.'
+  #   sleep 0.5
+  # done
+}
+
+get_max_rpm_json () {
+  check_cli_output
+
+  local fan=
+  local fans=
+
+  for f in {0..11}; do
+    fan=`cat $CLI_OUTPUT | grep "FAN No. $f max RPM:" | cut -f 6 -d " "`
+    [[ -z $fan || $fan == '-nan' ]] && fan=0
+
+    fans+=${fans:+,}'"fan'${f}'_max_rpm": '$fan
+  done
+
+  echo "{$fans}" | jq -c .
+}
+
+recalibrate_fans () { #native recalibration (-t) takes too much time this function is near five times faster
+  #create maintenance sem
+  echo "$(date +"%Y-%m-%d %T") - recalibrate fans" > $MAINTENANCE_SEM_NAME
+
+  #remove manual max rpm from config
+  sed -i 's/.*MAX_RPM.*//' $OCTOFAN_CONF
+
+  load_def_values
+
+  echo2 "${GREEN}$(date +"%Y-%m-%d %T")${NOCOLOR}"
+  echo2 "Setting fans speed to max"
+  for i in {0..11}; do
+    $OCTOFAN_BIN -f $i -v 255
+    sleep 0.1
+  done
+
+  #time to spin up fans
+  sleep 4.4
+
+  echo2 "${GREEN}$(date +"%Y-%m-%d %T")${NOCOLOR}"
+  echo2 "Testing max fans RPM"
+
+  local fans_max_rpm=()
+  local t_rpm=0
+  for t in {1..5}; do
+    $OCTOFAN_BIN -r > $CLI_OUTPUT
+    for i in {0..11}; do
+      t_rpm=`cat $CLI_OUTPUT | grep "FAN No. $i RPM:" | cut -d " " -f 5`
+      [[ ${fans_max_rpm[$i]} -lt $t_rpm ]] && fans_max_rpm[$i]=$t_rpm
+      #sleep 0.1
+    done
+    sleep 0.7
+  done
+
+  echo2 "${GREEN}$(date +"%Y-%m-%d %T")${NOCOLOR}"
+  echo "Saving max values: ${fans_max_rpm[@]}"
+  for i in {0..11}; do
+    [[ ! -z ${fans_max_rpm[$i]} ]] && t_rpm=${fans_max_rpm[$i]} || t_rpm=0
+    $OCTOFAN_BIN -m $i -v $t_rpm
+    if [[ $t_rpm -gt 0 ]]; then
+      if [[ $t_rpm -le $ERROR_RPM ]]; then
+        message error "Casefan #$i have max RPM $t_rpm."
+      elif [[ $t_rpm -le $WARNING_RPM ]]; then
+        message warning "Casefan #$i have max RPM $t_rpm."
+      fi
+    fi
+    sleep 0.1
+  done
+
+  #refresh cli output
+  $OCTOFAN_BIN -r > $CLI_OUTPUT
+
+  #remove maintenance sem
+  rm -f ${MAINTENANCE_SEM_NAME}
+
+  return 0
+}
+
+check_firmware () {
+  local fw_cur_ver=`$OCTOFAN_BIN -r | grep "VERSION-FW:" | cut -f 2 -d " "`
+  echo2 "Current FW version is: $fw_cur_ver"
+  local hw_cur_ver=`$OCTOFAN_BIN -r | grep "VERSION-HW:" | cut -f 2 -d " "`
+  echo2 "Current HW version is: $hw_cur_ver"
+
+  case $hw_cur_ver in
+    "0.9" )
+        FW_VERSION=$FW_VERSION_09
+        dpkg --compare-versions "$FW_VERSION" "le" "$fw_cur_ver"
+        if [ $? -ne "0" ]; then
+          check_avrdude
+          FW_FILENAME=$FW_FILENAME_09
+          FIRMWARE_MD5=$FIRMWARE_MD5_09
+          update_fw
         fi
-        detect_hardware
-        load_config
-        if [[ $HW_DETECTED -eq 1 ]]; then
-            apply_all_fans_speed "$2"
-            echo "Fans regles a ${2}%%"
-        else
-            echo "Pas de materiel detecte"
-            exit 1
+      ;;
+    "0.7" )
+        FW_VERSION=$FW_VERSION_07
+        dpkg --compare-versions "$FW_VERSION" "le" "$fw_cur_ver"
+        if [ $? -ne "0" ]; then
+          check_avrdude
+          FW_FILENAME=$FW_FILENAME_07
+          FIRMWARE_MD5=$FIRMWARE_MD5_07
+          update_fw
         fi
-        exit 0
-        ;;
-    --max)
-        detect_hardware
-        load_config
-        if [[ $HW_DETECTED -eq 1 ]]; then
-            apply_all_fans_speed 100
-            echo "Fans regles a 100%%"
-        else
-            echo "Pas de materiel detecte"
-            exit 1
-        fi
-        exit 0
-        ;;
-    --min)
-        detect_hardware
-        load_config
-        if [[ $HW_DETECTED -eq 1 ]]; then
-            apply_all_fans_speed "$MIN_FAN"
-            echo "Fans regles a ${MIN_FAN}%%"
-        else
-            echo "Pas de materiel detecte"
-            exit 1
-        fi
-        exit 0
-        ;;
-    "")
-        main
-        ;;
-    *)
-        echo "Option inconnue: $1"
-        echo "Utilisez --help pour l'aide"
-        exit 1
-        ;;
-esac
+      ;;
+    * )
+        echo2 "No firmware updates for your hardware"
+      ;;
+  esac
+}
+
+check_sem () {
+if [[ -f $MAINTENANCE_SEM_NAME ]]; then
+  a=0
+  let a=`date +%s`-`stat --format='%Y' $MAINTENANCE_SEM_NAME`
+  if [[ a -le 60 ]]; then
+    echo2 "Octofan is in maintenance mode. Command ignored."
+    return 1 #octofan in maintenance mode
+  else
+    return 0
+  fi
+fi
+}
+
+function log_truncate () {
+  [[ ! -e $CLI_LOG_BASE_NAME.log ]] && return 0
+
+  local fsize=`stat -c%s $CLI_LOG_BASE_NAME.log`
+  [[ ! -z $fsize && $fsize -ge $MAX_LOG_SIZE ]] &&
+    echo "*** truncated by $0" > $CLI_LOG_BASE_NAME.log
+
+  return 0
+}
+
+function logs_rotate () {
+  # Make sure logs dir exists
+  mkdir -p $CLI_LOGS_BASE_DIR
+
+  [[ -e $CLI_LOG_BASE_NAME.log.5 ]] && rm $CLI_LOG_BASE_NAME.log.5
+  [[ -e $CLI_LOG_BASE_NAME.log.4 ]] && mv -f $CLI_LOG_BASE_NAME.log.4 $CLI_LOG_BASE_NAME.log.5
+  [[ -e $CLI_LOG_BASE_NAME.log.3 ]] && mv -f $CLI_LOG_BASE_NAME.log.3 $CLI_LOG_BASE_NAME.log.4
+  [[ -e $CLI_LOG_BASE_NAME.log.2 ]] && mv -f $CLI_LOG_BASE_NAME.log.2 $CLI_LOG_BASE_NAME.log.3
+  [[ -e $CLI_LOG_BASE_NAME.log.1 ]] && mv -f $CLI_LOG_BASE_NAME.log.1 $CLI_LOG_BASE_NAME.log.2
+  [[ -e $CLI_LOG_BASE_NAME.log ]] && mv -f $CLI_LOG_BASE_NAME.log $CLI_LOG_BASE_NAME.log.1
+
+  return 0
+}
+
+function echo_log () {
+  echo2 "$1" >> $CLI_LOG_BASE_NAME.log
+}
+
+function write_cli_log () {
+  check_cli_output
+  echo_log "$(date +"%Y-%m-%d %T")"
+
+  local t_fans
+  for (( i = 0; i < ${#FAN_ARRAY[@]}; i++ )); do
+    t_fans+="Case FAN$i "`cat $CLI_OUTPUT | grep "FAN No. $i RPM:" | cut -d " " -f 5`"rpm   "
+  done
+
+  local in_t=`cat $CLI_OUTPUT | grep "BME280 No. 0 Temp: " | cut -d " " -f 5`
+  [[ -z $in_t || $in_t == '-nan' ]] && in_t=`cat $CLI_OUTPUT | grep "Temperature No. 0" | cut -d " " -f 5`
+  local out_t=`cat $CLI_OUTPUT | grep "BME280 No. 1 Temp: " | cut -d " " -f 5`
+  [[ -z $out_t || $out_t == '-nan' ]] && out_t=`cat $CLI_OUTPUT | grep "Temperature No. 1" | cut -d " " -f 5`
+  echo_log "Case temperature intake: ${in_t}°C   outgoing: ${out_t}°C"
+
+  local psu_count=`cat $CLI_OUTPUT | grep "PSU No." | tail -1 | cut -d " " -f 4`
+  if [[ ! -z $psu_count ]]; then
+    for (( i = 0; i <= $psu_count; i++ )); do
+      local t_model=`cat $CLI_OUTPUT | grep "PSU No. $i" | tail -1 | cut -d " " -f 1`
+      local t_voltage_ac=`cat $CLI_OUTPUT | grep "PSU No. $i Vac:" | cut -d " " -f 6`
+      local t_power_ac=`cat $CLI_OUTPUT | grep "PSU No. $i Pac:" | cut -d " " -f 6`
+      local t_voltage_dc=`cat $CLI_OUTPUT | grep "PSU No. $i Vdc:" | cut -d " " -f 6`
+      echo_log "PSU$i $t_model Vac: ${t_voltage_ac}V   Pac: ${t_power_ac}W   Vdc: ${t_voltage_dc}V"
+
+      local psu_in_t=`cat $CLI_OUTPUT | grep "PSU" | grep "T1:" | cut -d " " -f 6 | awk '{sum+=$1} END { printf "%.0f", sum/NR }'` #mean intake temp
+      local psu_out_t=`cat $CLI_OUTPUT | grep "PSU" | grep "T2:" | cut -d " " -f 6 | awk '{sum+=$1} END { printf "%.0f", sum/NR }'` #mean exhast temp
+      echo_log "     temperature intake: ${psu_in_t}°C   outgoing: ${psu_out_t}°C" #   board: ${psu_board_t}°C
+    done
+  fi
+
+  echo_log ""
+}
+
+if [ ! $1 = "" ]; then
+  check_sem
+  [[ $? -ne 0 ]] && exit 1 #octofan in maintenance mode
+fi
+
+# load_def_values
+
+if [[ $1 == "get_fan_json" || $1 == "-f" ]]; then
+  get_fan_json_percent
+elif [[ $1 == "get_temp_json" || $1 == "-t" ]]; then
+  get_temp_json
+elif [[ $1 == "get_psu_json" || $1 == "-p" ]]; then
+  get_psu_json
+elif [[ $1 == "get_bme_json" || $1 == "-b" ]]; then
+  get_bme_json
+elif [[ `lsusb | grep -c 16c0:05dc` -ge 1 ]]; then
+  if [[ $1 == "update_text" || $1 == "-ut" ]];  then
+    update_text $2 $3
+  elif [[ $1 == "write_cli_log" || $1 == "-wl" ]]; then
+    write_cli_log
+  elif [[ $1 == "blink_error" || $1 == "-e" ]]; then
+    blink_error
+  elif [[ $1 == "blink_warning"|| $1 == "-w" ]]; then
+    blink_warning
+  elif [[ $1 == "blink_off" || $1 == "-off" ]]; then
+    blink_off
+  elif [[ $1 == "log_truncate" || $1 == "-tl" ]]; then
+    log_truncate
+  elif [[ $1 == "run" ]]; then
+    # recalibrate_fans
+    load_def_values
+    check_config
+    logs_rotate
+    check_firmware | tee "$FIRMWARE_UPDATE_LOG"
+    check_snmpd
+
+    octo_fan_control
+  elif [[ $1 == "save_text_to_EEPROM" ]]; then
+    save_text_to_EEPROM
+  # elif [[ $1 == "get_fan" ]]; then
+  #   [[ ! -z $2 ]] && echo `calc_fan_speed $2`
+  # elif [[ $1 == "get_temp" ]]; then
+  #   get_temp $2
+  elif [[ $1 == "recalibrate" || $1 == "-r" ]]; then
+    recalibrate_fans
+  elif [[ $1 == "dontattach" ]]; then
+    session_count=`screen -ls octofan | grep octofan | wc -l`
+    if [[ $session_count -eq 0 ]]; then
+      #start new screen
+      echo2 "> Starting octofan"
+      screen -dm -S octofan $0 run
+      echo2 "Octofan screen started"
+    fi
+  elif [[ $1 == "get_max_rpm_json" || $1 == "-m" ]]; then
+    get_max_rpm_json
+  elif [[ $1 == "logs_rotate" || $1 == "-rl" ]]; then
+    logs_rotate
+  elif [[ $1 == "" ]]; then
+    session_count=`screen -ls octofan | grep octofan | wc -l`
+    if [[ $session_count -gt 0 ]]; then
+      screen -x -S octofan
+    else #start new screen
+      echo2 "> Starting octofan"
+      screen -dm -S octofan $0 run
+      echo2 "Octofan screen started"
+    fi
+  fi
+else
+  echo "No Octofan hardware found"
+fi
+exit 0
